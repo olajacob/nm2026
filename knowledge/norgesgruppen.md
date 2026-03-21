@@ -445,6 +445,51 @@ claude mcp add --transport http nmiai https://mcp-docs.ainm.no/mcp
 
 ## Local workspace
 
-Repo layout often mirrors downloads under **`norgesgruppen/`** (e.g. `train/annotations.json`, `train/images/`, `NM_NGD_product_images/`). **Quick commands:** [`norgesgruppen/README.md`](../norgesgruppen/README.md). Local **`train.py`** writes **`dataset.yaml`** with both **`train:`** and **`val:`** ( **`val: images/train`** reuses the train folder until a real validation split exists — some Ultralytics versions expect **`val`** to be set). **Local training:** **`train.py`** uses **`cuda` → `mps` → `cpu`**; default batch **16** / **8** / **4**; **`--epochs`** default **100**, **`imgsz`** **640**. On **non-CUDA**, Ultralytics still runs validation on the **last epoch** and **`final_eval`**; that can crash (**Half** / DFL) with many classes. **`train.py`** then applies a **temporary monkeypatch** (`BaseTrainer.validate` / **`final_eval`**) so training finishes; **fitness** is approximated from **train loss** — treat **`best.pt`** as a hint, prefer **`last.pt`** or re-validate on **CUDA**. **`--force-val`** disables the patch and runs real validation (may crash on **MPS**).
+Repo layout often mirrors downloads under **`norgesgruppen/`** (e.g. `train/annotations.json`, `train/images/`, `NM_NGD_product_images/`). **Quick commands:** [`norgesgruppen/README.md`](../norgesgruppen/README.md). Local **`train.py`** writes **`dataset.yaml`** with both **`train:`** and **`val:`** ( **`val: images/train`** reuses the train folder until a real validation split exists — some Ultralytics versions expect **`val`** to be set). **Local training:** **`train.py`** uses **`cuda` → `mps` → `cpu`**; default batch **16** / **8** / **4**; default **`--model s`**, **`--epochs` 150**, **`patience` 20**, optional **`--cos-lr`**; **`imgsz`** **640**. On **non-CUDA**, Ultralytics still runs validation on the **last epoch** and **`final_eval`**; that can crash (**Half** / DFL) with many classes. **`train.py`** then applies a **temporary monkeypatch** (`BaseTrainer.validate` / **`final_eval`**) so training finishes; **fitness** is approximated from **train loss** — treat **`best.pt`** as a hint, prefer **`last.pt`** or re-validate on **CUDA**. **`--force-val`** disables the patch and runs real validation (may crash on **MPS**). **`run.py`** optionally loads **ResNet18** embeddings over **`NM_NGD_product_images/`** when **`annotations.json`** is co-located — see **Improvement plan — 2026-03-22** above.
 
 **PyTorch 2.6+ and Ultralytics:** `torch.load` defaults to **`weights_only=True`**, which breaks unpickling full **Ultralytics** **`.pt`** files (they reference many module types, not only **`DetectionModel`**). **`run.py`** and **`train.py`** register **`torch.serialization.add_safe_globals([DetectionModel])`** and wrap **`torch.load`** so **`weights_only`** defaults to **`False`** when the caller omits it (same idea as trusted-checkpoint loading), **before** any **`YOLO(...)`** call.
+
+---
+
+## Improvement plan — 2026-03-22
+
+### PUNKT 1 — Product-image retrieval in `run.py` (done in repo)
+
+**Problem:** Final score is **`0.7 × detection_mAP + 0.3 × classification_mAP`**. A plain YOLO head on **357** classes (or COCO-pretrained **80** classes) gives poor **classification_mAP** unless the detector is well fine-tuned.
+
+**Approach:** At startup, **`run.py`** (when files are present) builds an in-memory **reference library**:
+
+1. **`NM_NGD_product_images/metadata.json`** + **`train/annotations.json`** (or **`annotations.json`** next to **`run.py`**) → map **`product_code`** (folder name) → **`category_id`** by matching **`product_name`** to COCO **`categories[].name`** (normalized uppercase / spaces). One product in metadata needed **fuzzy** match (`difflib`, cutoff **0.82**); **326** exact + **1** fuzzy in local snapshot.
+2. For each folder under **`NM_NGD_product_images/{product_code}/`**, load up to **3** images (priority: **`main`**, **`front`**, **`back`**, …).
+3. **torchvision `resnet18`** (**`ResNet18_Weights.IMAGENET1K_V1`**, **`fc` → `Identity`**, **L2-normalized** **512**-D embedding). **ImageNet** **`Normalize`** mean/std are **hardcoded** in **`run.py`** (not **`weights.meta`**) for compatibility with older **torchvision** on **Python 3.9**. Weights load from the usual **Torch** cache (**`~/.cache/torch`** / hub) — **no network** in sandbox if weights are already cached (sandbox ships **torchvision 0.21.0**).
+4. After each YOLO box, **crop XYXY** (clamped), embed, **cosine similarity** vs all reference vectors → **nearest neighbor** **`category_id`**. If **max similarity &lt; 0.3** (override with **`run.py --sim-threshold`**), keep the **YOLO class** (same as before).
+5. Output JSON unchanged: **`[{image_id, category_id, bbox, score}]`**.
+
+**Submission zip:** To enable this in the sandbox, include alongside **`run.py`** / **`model.pt`**:
+
+- **`train/annotations.json`** (or **`annotations.json`** at zip root) — for **name → id** alignment only;  
+- **`NM_NGD_product_images/`** tree (**`metadata.json`** + **`{product_code}/*.jpg`**).  
+- **Offline sandbox:** place **`resnet18-f37072fd.pth`** (ImageNet **ResNet18** `state_dict`) next to **`run.py`** — **`run.py`** loads it with **`weights_only=True`**; if missing, it falls back to **`ResNet18_Weights.IMAGENET1K_V1`** (needs download — not available without network in sandbox).
+
+Keep **uncompressed zip ≤ 420 MB** (reference pack ≈ **60 MB** — fits).
+
+If those paths are missing, **`run.py`** skips the library and behaves like **YOLO-only** classification.
+
+### PUNKT 2 — Train **YOLOv8s** instead of **YOLOv8n** (done in repo defaults)
+
+**`train.py`** default **`--model`** is now **`s`** (was **`m`** in code / **`n`** in older docs). Larger backbone → better **detection_mAP** (the **0.7** term). **Run on GCP GPU** for throughput; reduce **`--batch`** if needed vs **`n`**.
+
+### PUNKT 3 — Longer training + cosine LR (done in repo)
+
+**`train.py`:** default **`--epochs`** **150**, **`patience=20`**, optional **`--cos-lr`** → passes **`cos_lr=True`** into **`model.train()`** (Ultralytics **8.1** **`default.yaml`**).
+
+**Suggested GCP command:**
+
+```bash
+python3 train.py --data train --model s --epochs 150 --cos-lr
+```
+
+### Findings
+
+- **Reference ↔ COCO alignment:** **`metadata.json`** **`product_name`** vs **`annotations.json`** **`categories[].name`** gives **~327** mapped products locally (exact + one fuzzy).  
+- **Classification_mAP** should improve when **detection** crops align with **reference pack** photos (same SKU, different shelf lighting — **ResNet** retrieval is a **baseline**, not a ceiling).

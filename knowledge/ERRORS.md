@@ -11,6 +11,24 @@ Newest entries at the **top**.
 
 ## Log
 
+### 2026-03-22 — **403 proxy token:** full **`GET /ledger/account`** chart scan before bilag
+
+- **Symptom**: Many **`tripletex_get`** calls with **`from`/`count`** over **`/ledger/account`**, then **403** *Invalid or expired proxy token*; **`tripletex_post_voucher`** never persists.
+- **Type**: **Infrastructure** (token budget) + **deterministic** (avoidable call pattern).
+- **Conclusion**: Resolve each stated GL number with **`GET /ledger/account?number=N&fields=id,number,name`** — **not** full-chart pagination. **`agent.py` SYSTEM_PROMPT** + **`tripletex_get`** tool text updated — **→** [tripletex.md](tripletex.md) **Custom dimensions & ledger**.
+
+### 2026-03-22 — **Ledger voucher:** empty shell **422** *«…uten posteringer»* — **one-step first**
+
+- **Symptom**: **`tripletex_post_voucher`** used **POST /ledger/voucher?sendToLedger=false** with **`postings: []`**, then **`/postings`** sub-resource — tenant returns **422** *«Et bilag kan ikke registreres uten posteringer»* (must not create a shell **without** lines).
+- **Type**: Deterministic (tenant validation).
+- **Conclusion**: **`post_voucher_two_step`** now **POST**s the **full** **`postings`** array on **`/ledger/voucher`** first (`?sendToLedger=false`), then retries **without** the **`sendToLedger`** query if needed, then falls back to shell + **`/postings`** on **systemgenererte** / remaining **422** — **→** `agent.py`, [tripletex.md](tripletex.md), **SYSTEM_PROMPT**.
+
+### 2026-03-21 — **«Crie e envie»** / **send invoice** — **0/7** despite **200** API
+
+- **Symptom**: Tripletex run completes **POST /order** + **`PUT /order/{id}/:invoice`** with **200**; platform shows **Task 0/7**, all checks failed. Log shows *Faktura må sendes manuelt* on the order / invoice is created but not transmitted.
+- **Type**: Deterministic (task wording + missing API step).
+- **Conclusion**: **`PUT /order/.../:invoice`** **creates** the invoice document; **sending** is a separate action: **`PUT /invoice/{invoiceId}/:send`** with **required** query **`sendType`** (**EMAIL**, **EHF**, **MANUAL**, …). Portuguese **«envie»**, English **«send»**, etc. require this step — **concluded.** **→** `agent.py` **SYSTEM_PROMPT** (Create invoice step 5), **`tripletex_put_action`** tool text, [tripletex.md](tripletex.md).
+
 ### 2026-03-22 — **Multi-rate invoice:** order lines inherit **product** **vatType**
 
 - **Symptom**: Task states **different VAT % per invoice line**; **`POST /order`** uses **`orderLines`** **without** **`vatType`**; invoice lines show wrong **vatType** (e.g. **0%** from product master on a line that should match another rate) — grader / checks fail despite **200** API responses.

@@ -9,7 +9,7 @@ Requirements:
   pip install ultralytics==8.1.0
 
 Usage (from norgesgruppen/):
-  python3 train.py --data train --model n --epochs 100
+  python3 train.py --data train --model s --epochs 150 --cos-lr
 
 Output:
   ./runs/detect/ng_model/weights/best.pt  → copy to ./model.pt for submission
@@ -195,11 +195,12 @@ def _training_device_and_batch(batch_override: int | None) -> tuple[str, int]:
 
 def train(
     data_path: Path,
-    model_size: str = "m",
-    epochs: int = 100,
+    model_size: str = "s",
+    epochs: int = 150,
     imgsz: int = 640,
     batch: int | None = None,
     force_val: bool = False,
+    cos_lr: bool = False,
 ) -> Path:
     train_root = resolve_coco_train_root(data_path)
     yolo_dir = train_root.parent / "yolo_dataset"
@@ -236,7 +237,8 @@ def train(
             val=use_yaml_val,
             project="runs/detect",
             name="ng_model",
-            patience=10,
+            patience=20,
+            cos_lr=cos_lr,
             save=True,
             plots=True,
             mosaic=1.0,
@@ -264,8 +266,8 @@ if __name__ == "__main__":
         required=True,
         help="Path to train/ (annotations.json + images/) or NM_NGD root containing train/",
     )
-    parser.add_argument("--model", default="m", choices=["n", "s", "m", "l", "x"])
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--model", default="s", choices=["n", "s", "m", "l", "x"])
+    parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument(
         "--batch",
@@ -278,6 +280,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Run per-epoch validation on MPS/CPU anyway (may crash with many classes; default: val only on CUDA)",
     )
+    parser.add_argument(
+        "--cos-lr",
+        action="store_true",
+        help="Cosine learning rate decay (Ultralytics cos_lr)",
+    )
     args = parser.parse_args()
 
     train(
@@ -287,4 +294,5 @@ if __name__ == "__main__":
         args.imgsz,
         args.batch,
         force_val=args.force_val,
+        cos_lr=args.cos_lr,
     )

@@ -28,13 +28,13 @@ Fra **`norgesgruppen/`** pek **`--data`** på **`train`** (eller full sti til ma
 
 ```bash
 cd nmai2026/norgesgruppen
-python3 train.py --data train --model n --epochs 100
+python3 train.py --data train --model s --epochs 150 --cos-lr
 ```
 
 Offisiell zip-struktur med ekstra **`train/`**-nivå støttes også:
 
 ```bash
-python3 train.py --data /path/to/NM_NGD_coco_dataset --model m --epochs 50
+python3 train.py --data /path/to/NM_NGD_coco_dataset --model s --epochs 150 --cos-lr
 ```
 
 Det genereres **`yolo_dataset/`** ved siden av **`train/`** (konvertert COCO → YOLO). Kjør `train.py` fra samme katalog hvert gang, så havner **`runs/detect/...`** forutsigbart.
@@ -51,7 +51,8 @@ Kun filer som trengs i sandbox (spar plass — dropp gjerne `train.py` hvis du v
 
 ```bash
 cd nmai2026/norgesgruppen
-zip -r ../submission.zip run.py model.pt -x ".*" "__MACOSX/*"
+# For embedding-basert klassifisering i run.py: ta med NM_NGD_product_images/ + train/annotations.json
+zip -r ../submission.zip run.py model.pt train/annotations.json NM_NGD_product_images -x ".*" "__MACOSX/*" "*/__pycache__/*"
 # valgfritt: legg til train.py om du vil -- tar én av max 10 .py-filer
 ```
 

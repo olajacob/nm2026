@@ -1,5 +1,9 @@
 # Tripletex-agent (NM i AI 2026)
 
+## Dokumentasjon for assistenter
+
+- **[CLAUDE.md](CLAUDE.md)** — detaljert handoff om bl.a. **`POST /supplierInvoice`** (påkrevde felter, 500-retry, tenant-quirks). Speiler og utdyper `SYSTEM_PROMPT` i `agent.py`.
+
 ## Kjøre agenten
 
 ```bash

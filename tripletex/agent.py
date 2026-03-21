@@ -500,14 +500,6 @@ def _voucher_422_detail_lower(exc: requests.HTTPError) -> str:
         return ""
 
 
-def _voucher_422_is_uten_posteringer(detail: str) -> bool:
-    return (
-        "uten posteringer" in detail
-        or "kan ikke registreres uten posteringer" in detail
-        or "without postings" in detail
-    )
-
-
 def _voucher_422_is_systemgenererte(detail: str) -> bool:
     return (
         "systemgenererte" in detail
@@ -632,10 +624,11 @@ def post_voucher_two_step(
     shell_extras: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
-    Prefer **one** POST /ledger/voucher with full **postings** in the body (sendToLedger=false),
-    then retry without query if tenant returns *uten posteringer*, then retry same URL with body
-    key **posting** (singular) for API variants that expect that name, then fall back to empty shell
-    + /postings sub-resource (e.g. after *systemgenererte* 422).
+    Fallback order (some tenants reject **empty** shell POST — try inline / singular first):
+    **1)** POST /ledger/voucher?sendToLedger=false with full **postings**
+    **2)** POST /ledger/voucher (no query) with full **postings**
+    **3)** POST /ledger/voucher with top-level **posting** (singular)
+    **4)** Last resort: empty shell + POST /ledger/voucher/{id}/postings per line
     """
     shell_base: dict[str, Any] = {"date": date, "description": description}
     if shell_extras:
@@ -667,59 +660,52 @@ def post_voucher_two_step(
     if _voucher_422_is_systemgenererte(d1):
         _agent_print(
             "  ℹ️  voucher: one-step 422 (systemgenererte / similar) — "
-            "two-step shell + /postings sub-resource."
+            "trying no-query / singular `posting` before two-step shell."
         )
-        return _post_voucher_shell_then_posting_lines(
-            api, shell_base, postings_lines, send_to_ledger
+    else:
+        _agent_print(
+            "  ℹ️  voucher: one-step 422 — retry POST without sendToLedger query, then singular `posting`, "
+            "then two-step shell (last resort)."
         )
 
-    if _voucher_422_is_uten_posteringer(d1):
-        # --- 2) Same body, no sendToLedger query (some tenants reject ?sendToLedger=false + inline postings) ---
-        try:
-            voucher_json = api.post("/ledger/voucher", full_body)
-            return _finalize_voucher_create(
-                api,
-                voucher_json,
-                send_to_ledger=send_to_ledger,
-                posting_mode="one_step_inline_no_query",
-            )
-        except requests.HTTPError as e2:
-            if e2.response.status_code != 422:
-                raise
-            _agent_print(
-                "  ℹ️  voucher: inline `postings` still 422 after dropping sendToLedger query — "
-                "trying body key `posting` (singular)."
-            )
-            _agent_print("  ℹ️  attempt 2b: trying singular 'posting' field name")
-            # --- 2b) Singular top-level key "posting" (some OpenAPI / proxy stacks differ) ---
-            singular_body: dict[str, Any] = {**shell_base, "posting": norm_lines}
-            try:
-                _agent_print(
-                    "  📤 voucher attempt 2b: POST /ledger/voucher with field name **`posting`** (singular) "
-                    f"(preview): {_log_preview(json.dumps(singular_body, ensure_ascii=False), 500)}"
-                )
-                voucher_json = api.post("/ledger/voucher", singular_body)
-                return _finalize_voucher_create(
-                    api,
-                    voucher_json,
-                    send_to_ledger=send_to_ledger,
-                    posting_mode="one_step_inline_posting_singular",
-                )
-            except requests.HTTPError as e3:
-                if e3.response.status_code != 422:
-                    raise
-                d3 = _voucher_422_detail_lower(e3)
-                _agent_print(
-                    "  ℹ️  voucher: singular `posting` still 422 — two-step shell + /postings. "
-                    f"(detail preview: {_log_preview(d3, 200)})"
-                )
-                return _post_voucher_shell_then_posting_lines(
-                    api, shell_base, postings_lines, send_to_ledger
-                )
+    # --- 2) One-step: same body, no sendToLedger query ---
+    try:
+        voucher_json = api.post("/ledger/voucher", full_body)
+        return _finalize_voucher_create(
+            api,
+            voucher_json,
+            send_to_ledger=send_to_ledger,
+            posting_mode="one_step_inline_no_query",
+        )
+    except requests.HTTPError as e2:
+        if e2.response.status_code != 422:
+            raise
 
-    _agent_print(
-        "  ℹ️  voucher: one-step 422 — two-step shell + /postings sub-resource."
-    )
+    # --- 3) Singular top-level key "posting" (some OpenAPI / proxy stacks differ) ---
+    _agent_print("  ℹ️  attempt 2b: trying singular 'posting' field name")
+    singular_body: dict[str, Any] = {**shell_base, "posting": norm_lines}
+    try:
+        _agent_print(
+            "  📤 voucher attempt 2b: POST /ledger/voucher with field name **`posting`** (singular) "
+            f"(preview): {_log_preview(json.dumps(singular_body, ensure_ascii=False), 500)}"
+        )
+        voucher_json = api.post("/ledger/voucher", singular_body)
+        return _finalize_voucher_create(
+            api,
+            voucher_json,
+            send_to_ledger=send_to_ledger,
+            posting_mode="one_step_inline_posting_singular",
+        )
+    except requests.HTTPError as e3:
+        if e3.response.status_code != 422:
+            raise
+        d3 = _voucher_422_detail_lower(e3)
+        _agent_print(
+            "  ℹ️  voucher: singular `posting` still 422 — two-step shell + /postings (last resort). "
+            f"(detail preview: {_log_preview(d3, 200)})"
+        )
+
+    # --- 4) Last resort: empty shell + /postings sub-resource ---
     return _post_voucher_shell_then_posting_lines(
         api, shell_base, postings_lines, send_to_ledger
     )
@@ -1176,14 +1162,14 @@ POST /customer {
 **Flags — set explicitly (Tripletex defaults `isCustomer` to true if omitted; graders often expect pure suppliers with `isCustomer: false`):**
 - **Customer only** (kunde, customer, client, …): **`isCustomer: true`**, **`isSupplier: false`** unless the prompt also makes them a supplier.
 - **Supplier only** (leverandør, supplier, proveedor, fournisseur, Lieferant, …): **`isSupplier: true`**, **`isCustomer: false`** — **always** send **`isCustomer: false`** on **POST**.
-- **Supplier-only — tenant quirk:** Many tenants **return** **`isCustomer: true`** in the **`POST /customer`** response **even when** you sent **`isCustomer: false`** (Tripletex defaults kunde). **Graders** often require **pure supplier** = **`isCustomer: false`**. **Immediately** after a successful **supplier-only** **POST**, check **`value.isCustomer`** (or **`value`** from the tool result). **If** **`isCustomer`** is still **`true`**, call **`tripletex_put` `PUT /customer/{id}`** with body **`{"isCustomer": false}`** — **one** extra HTTP call before continuing (e.g. before **`POST /supplierInvoice`**). **Do not** skip this when the task is **leverandør-only**.
+- **Supplier-only — tenant quirk:** Many tenants **return** **`isCustomer: true`** in the **`POST /customer`** response **even when** you sent **`isCustomer: false`**. **Do not** trust **`POST`** alone — **persisted** state must be read via **GET**. After **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**: **(1)** **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** — **(2)** if **`isCustomer`** is still **`true`**, **`tripletex_put` `PUT /customer/{id}`** body **`{"isCustomer": false}`** — **(3)** **verify** with another **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** if the grader requires a clean check. Then continue (e.g. **`POST /supplierInvoice`**). **Do not** skip this when the task is **leverandør-only**.
 - **Both** roles only when the prompt **explicitly** says the entity is a customer **and** a supplier: **`isCustomer: true`**, **`isSupplier: true`**.
 CRITICAL: Never omit email or organizationNumber if they appear in the prompt.
 
 Register supplier invoice (leverandørfaktura) — **Task 23 pattern** (mottatt faktura, **fournisseur**, **supplier invoice**, **registrer leverandørfaktura**):
 When the task is to **record** / **register** / **book** a **received supplier invoice** (amount **TTC** / **inkl. MVA**, invoice number, cost account like **7300**), you **must** create the **supplier invoice** in Tripletex — **not** stop after **`POST /customer`**. **Do not** use **`tripletex_post_voucher`** / **`/ledger/voucher`** for this flow unless the tenant truly exposes no **`/supplierInvoice`** create — **primary path:** **`tripletex_post`** **`POST /supplierInvoice`**.
 
-1. **Supplier:** **`GET /customer?organizationNumber=X&fields=id,name,organizationNumber,isSupplier`** (and **`email`** if needed). If **no row**, **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**, **`name`**, **`organizationNumber`**, **`email`** when stated. **`supplier_id`** = matching **`values[].id`** from **GET**, or **`value.id`** from **`POST /customer`** (same resource as supplier in Tripletex).
+1. **Supplier:** **`GET /customer?organizationNumber=X&fields=id,name,organizationNumber,isSupplier,isCustomer`** (and **`email`** if needed). If **no row**, **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**, **`name`**, **`organizationNumber`**, **`email`** when stated. **`supplier_id`** = matching **`values[].id`** from **GET**, or **`value.id`** from **`POST`**. For **supplier-only** tasks: **after** **`POST /customer`**, or whenever **`values[]`** / **`value`** shows **`isCustomer: true`**, follow **Supplier-only — tenant quirk**: **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** (always include **`isCustomer`** in **`fields`** to verify persisted state **before** **`PUT`**) → **`PUT`** if needed → optional **second `GET`** to verify.
 2. **Cost / expense account:** **one** **`GET /ledger/account?number=NNNN&fields=id,number,name`** for the **stated** GL (**7300**, etc.) — **do not** scan many account numbers «just in case»; use for **follow-up** (voucher / line edits) only after **`POST /supplierInvoice`** succeeds **or** if the API documents a **required** field you still lack.
 3. **Create invoice — `POST /supplierInvoice`:** Bare **`invoiceNumber`** + **`invoiceDate`** + **`supplier`** uten beløp ga **HTTP 500** (code **1000**) i live-test — sannsynlig **manglende påkrevd felt**. **Standard body** (beløp **inkl. MVA** som oppgaven oppgir som TTC / inkl. MVA / «inklusive»):
 ```json

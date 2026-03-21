@@ -3,9 +3,15 @@
 
   TRIPLETEX_BASE_URL   default: https://kkpqfuj-amager.tripletex.dev/v2
   TRIPLETEX_SESSION_TOKEN   required for a real run
+
+For more checks (ledger account, customer list, optional agent /health), see test_sandbox.py.
 """
 
 from __future__ import annotations
+
+import warnings
+
+warnings.filterwarnings("ignore", message=r"urllib3 v2 only supports OpenSSL")
 
 import os
 import sys

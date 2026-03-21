@@ -1,15 +1,15 @@
 {
-  "updated": "2026-03-21 19:00",
+  "updated": "2026-03-21 19:30",
   "leaderboard": {
-    "rank": 181,
+    "rank": 180,
     "total_teams": 430,
-    "score": 28.26,
-    "tripletex": 11.0,
+    "score": 29.54,
+    "tripletex": 12.8,
     "norgesgruppen": 29.7,
     "astar": 39.6
   },
-  "runs_today": 108,
-  "last_run_task": "16",
+  "runs_today": 112,
+  "last_run_task": "23",
   "deadline": "2026-03-22 15:00",
   "tasks": [
     {"id": "01", "score": 1.50, "tries": 4},
@@ -30,11 +30,11 @@
     {"id": "16", "score": 2.67, "tries": 4},
     {"id": "17", "score": 0.31, "tries": 5},
     {"id": "18", "score": 0.50, "tries": 2},
-    {"id": "19", "score": 1.64, "tries": 3},
+    {"id": "19", "score": 1.77, "tries": 4},
     {"id": "20", "score": null, "tries": 1},
     {"id": "21", "score": 1.07, "tries": 1},
     {"id": "22", "score": null, "tries": 2},
-    {"id": "23", "score": null, "tries": 3},
+    {"id": "23", "score": 0.60, "tries": 4},
     {"id": "24", "score": null, "tries": 3},
     {"id": "25", "score": null, "tries": 2},
     {"id": "26", "score": 0.60, "tries": 2},
@@ -44,8 +44,15 @@
   ],
   "backlog": [
     {
-      "id": "next2",
+      "id": "next3",
       "status": "next",
+      "title": "Forbedre Task 23 score (leverandørfaktura)",
+      "detail": "Check 1 feiler — isCustomer: false ikke satt riktig. PUT /customer/{id} {isCustomer: false} etter POST. Mål: fra 0.60 til 1.0+.",
+      "affects": ["23"]
+    },
+    {
+      "id": "next2",
+      "status": "done",
       "title": "Bekreft voucher-fix i live run med bilag-task",
       "detail": "Task 08 fikk 100% (reise). Neste mål: få en voucher/bilag-task (06, 09, 11, 12) til å returnere voucherId uten 422. Sjekk last_solve.log for 'one_step_inline' eller 'two_step_subresource'.",
       "affects": ["06","09","11","12","22","24"]
@@ -178,9 +185,9 @@
     }
   ],
   "notes": [
-    "Task 16: 2.67 (timesheet + faktura + e-post) ✅",
-    "Totalpoeng 28.26, Tripletex 11.0 — klatrer!",
-    "NorgesGruppen: submit submission_tomorrow.zip i morgen tidlig",
-    "Deadline: 22. mars 15:00 — push til github + MIT-lisens"
+    "Task 23: 0.60 første score (leverandørfaktura med amountCurrency) ✅",
+    "Plass 180, totalpoeng 29.54 — klatrer!",
+    "NorgesGruppen: submit submission_tomorrow.zip i morgen tidlig kl 08:00",
+    "Deadline: 22. mars 15:00 — github push + MIT-lisens ✅"
   ]
 }

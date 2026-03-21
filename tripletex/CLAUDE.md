@@ -24,8 +24,8 @@ Dette dokumentet utdyper **`SYSTEM_PROMPT`** i `agent.py` for **leverandørfaktu
 
 | Steg | Handling |
 |------|----------|
-| A | **Leverandør:** `GET /customer` (f.eks. `organizationNumber`) → ev. **`POST /customer`** med `isSupplier: true`, `isCustomer: false`, + navn/orgnr/e-post fra oppgaven. |
-| A′ | **Tenant-quirk:** Hvis `POST /customer` returnerer `isCustomer: true` likevel → **`PUT /customer/{id}`** med `{"isCustomer": false}` **én gang** før du går videre (viktig for graders). |
+| A | **Leverandør:** `GET /customer` (f.eks. `organizationNumber`) med `fields` som inkluderer **`isCustomer`** → ev. **`POST /customer`** med `isSupplier: true`, `isCustomer: false`, + navn/orgnr/e-post fra oppgaven. |
+| A′ | **Tenant-quirk:** Etter **`POST`** (eller hvis liste-GET viser `isCustomer: true`): **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** → ved behov **`PUT /customer/{id}`** `{"isCustomer": false}` → valgfritt **nytt `GET`** for å verifisere (viktig for graders). Stol ikke på **`POST`**-respons alene. |
 | B | **Kostnadskonto:** **Én** `GET /ledger/account?number=NNNN` for oppgitt konto (f.eks. 7300) — til **oppfølging** etter faktura er opprettet; ikke masse-GET av kontoer. |
 | C | **`POST /supplierInvoice`** med standard body (se §3). |
 | D | Oppgave krever godkjenning: **`PUT /supplierInvoice/{id}/:approve`** via **`tripletex_put_action`** (ikke `:book` i standard v2). |

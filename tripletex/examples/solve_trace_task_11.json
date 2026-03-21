@@ -1,0 +1,9 @@
+{
+  "task_id": "11",
+  "prompt": "Replace with full Task 11 prompt. Logs will show TASK / RUN 11 for grep.",
+  "files": [],
+  "tripletex_credentials": {
+    "base_url": "https://kkpqfuj-amager.tripletex.dev/v2",
+    "session_token": "SET_ME_BASE64_SESSION_TOKEN"
+  }
+}

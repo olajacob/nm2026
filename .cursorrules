@@ -17,3 +17,9 @@
 - Target Python 3.12 for Python code in this repository.
 - Persistent project knowledge: read `knowledge/INDEX.md` at session start; load category files only as needed; log issues to `knowledge/ERRORS.md`.
 ---
+
+## Quick commands
+/nmai = Analyser tripletex/logs/last_solve.log (siste run), 
+implementer forbedringer i tripletex/agent.py, 
+test med python3 tripletex/test_sandbox.py,
+oppdater dashboard/data.json med funn.

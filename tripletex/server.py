@@ -8,6 +8,7 @@ Update data.json to reflect latest scores and backlog.
 import json
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 DATA_FILE = Path(__file__).parent / "data.json"
 PORT = 9999
@@ -174,7 +175,17 @@ function toggleTheme() {
 
 const data = __DATA__;
 
-document.getElementById('meta').textContent = 'Sist oppdatert: ' + data.updated;
+(function metaLine() {
+  const parts = [];
+  if (data.team_name) {
+    parts.push((data.team_flag ? data.team_flag + ' ' : '') + data.team_name);
+  }
+  if (data.tasks_solved) parts.push(data.tasks_solved + ' Tripletex');
+  const lrt = data.last_run_task != null && String(data.last_run_task).trim();
+  if (lrt) parts.push('Sist kjørt: Task ' + String(data.last_run_task).trim());
+  parts.push('Sist oppdatert: ' + data.updated);
+  document.getElementById('meta').textContent = parts.join(' · ');
+})();
 
 const lb = data.leaderboard;
 document.getElementById('metrics').innerHTML = `
@@ -245,6 +256,24 @@ data.notes.forEach(n => {
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/data.json":
+            try:
+                raw = DATA_FILE.read_text(encoding="utf-8")
+                json.loads(raw)
+            except Exception as e:
+                err = json.dumps({"error": str(e)})
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(err.encode("utf-8"))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(raw.encode("utf-8"))
+            return
+
         try:
             raw = DATA_FILE.read_text(encoding="utf-8")
             data = json.loads(raw)

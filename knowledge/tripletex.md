@@ -152,6 +152,7 @@ Mirror of **`agent.py` `SYSTEM_PROMPT`** — CSV from **`=== File:`** blocks →
 
 - **POST** **`/ledger/accountingDimensionName`**: body **`{"dimensionName": "…"}`** — **not** **`name`** or **`displayName`** (confirmed).
 - **POST** **`/ledger/accountingDimensionValue`**: body **`{"displayName": "…"}`** — **not** **`value`** or **`name`** (confirmed). Use the returned **value** **`id`** as **`Z`** below (not the dimension-name id).
+- **Bilag med dimensjon (Task ~06):** bruk **to ulike kontonumre** — aldri debet og kredit på **samme** `account.id`. På **debetlinjen**: **`freeAccountingDimension1: {id: <verdi-id>}`** (OpenAPI); du kan også sende **`accountingDimensionValues`** i verktøyet — **`agent.py`** mapper til **`freeAccountingDimension1`** (inline **POST /ledger/voucher** avviser **`accountingDimensionValues`**). Lokal sjekk: `python tripletex/test_sandbox.py --dimension-voucher`.
 - **Manual voucher (bilag) — field names (Swagger [v2-docs](https://tripletex.no/v2-docs/), schema **Voucher**):**
   - The only valid collection property is **`postings`** (**plural**, array of **Posting**). **Not** **`posting`**, **not** **`rows`** on the voucher.
   - **422** *«postings: Kan ikke være null»* → **`postings`** was **omitted** or **null**. **Always** send **`postings`** as an array: **`[]`** for an empty shell, or **`[...]`** with full lines if the tenant accepts one-shot create.

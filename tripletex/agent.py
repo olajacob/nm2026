@@ -14,6 +14,8 @@ import contextvars
 from contextlib import contextmanager
 from pathlib import Path
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import anthropic
 import time
 from datetime import datetime, timezone
@@ -27,10 +29,26 @@ app = FastAPI()
 
 API_KEY = os.environ.get("API_KEY", "")   # Optional — protects endpoint if set
 
+COMPETITION_BANK_ACCOUNT = os.environ.get(
+    "TRIPLETEX_COMPETITION_BANK_ACCOUNT", "86011117947"
+)
+COMPETITION_BASE_URL = os.environ.get(
+    "TRIPLETEX_COMPETITION_BASE_URL", "https://kkpqfuj-amager.tripletex.dev/v2"
+)
+
 # Per-request log files (set for the duration of POST /solve). See _solve_logging_session.
 _log_files_ctx: contextvars.ContextVar[Optional[tuple[TextIO, ...]]] = contextvars.ContextVar(
     "_agent_log_files", default=None
 )
+
+
+def _supplier_invoice_body_fingerprint(body: dict[str, Any]) -> str:
+    inv = str(body.get("invoiceNumber") or "").strip()
+    sup = body.get("supplier")
+    sid = ""
+    if isinstance(sup, dict) and sup.get("id") is not None:
+        sid = str(sup["id"])
+    return f"{inv}\x1f{sid}"
 
 
 def _real_stdout() -> Any:
@@ -127,7 +145,7 @@ class SolveRequest(BaseModel):
 
 
 def _resolve_task_label(req: SolveRequest, header_task_id: Optional[str]) -> str:
-    """Body.task_id > header X-Task-Id > env TASK_ID | NM_TASK_ID > placeholder."""
+    """Body.task_id > header X-Task-Id > env TASK_ID | NM_TASK_ID > TRIPLETEX_DEFAULT_TASK_ID > placeholder."""
     if req.task_id and str(req.task_id).strip():
         return str(req.task_id).strip()
     if header_task_id and str(header_task_id).strip():
@@ -136,6 +154,9 @@ def _resolve_task_label(req: SolveRequest, header_task_id: Optional[str]) -> str
         v = os.environ.get(key, "").strip()
         if v:
             return v
+    default_log = os.environ.get("TRIPLETEX_DEFAULT_TASK_ID", "").strip()
+    if default_log:
+        return default_log
     return "(not set — use JSON task_id, header X-Task-Id, or env TASK_ID / NM_TASK_ID)"
 
 
@@ -195,8 +216,8 @@ def _enrich_salary_transaction_body(body: dict[str, Any]) -> dict[str, Any]:
 
 def _enrich_employment_post_body(body: dict[str, Any]) -> dict[str, Any]:
     """
-    Pass-through only. Do **not** auto-inject **division** (or other fields): some tenants return **404**
-    on **POST /employee/employment** when the body includes **division**, **isMainEmployer**, or **taxDeductionCode**.
+    Pass-through. **Division on create** is handled in **`execute_tool`** via **`_employment_post_attempt_sequence`**
+    (minimal bodies: try **`division:{id:1..3}`** on **POST**, **404** each → next, then body without division).
     """
     return dict(body)
 
@@ -209,6 +230,24 @@ def _is_minimal_employment_post_body(body: dict[str, Any]) -> bool:
     if not isinstance(emp, dict) or set(emp.keys()) != {"id"} or emp.get("id") is None:
         return False
     return bool(body.get("startDate"))
+
+
+def _employment_post_attempt_sequence(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Ordered bodies for **POST /employee/employment**. Tenants may **404** when **`division`** is wrong/absent pattern;
+    **PUT** `division` after minimal create often **422** *«Virksomheten kan ikke endres»* — so try **division ids 1→2→3**
+    on **POST** (each step **only** after prior **HTTP 404**), then minimal `{employee, startDate}`.
+    """
+    b = dict(body)
+    if not _is_minimal_employment_post_body(b):
+        return [b]
+    if b.get("division") is not None:
+        return [b]
+    out: list[dict[str, Any]] = []
+    for div_id in (1, 2, 3):
+        out.append({**b, "division": {"id": div_id}})
+    out.append(b)
+    return out
 
 
 def _lock_employments_for_employees(api: "TripletexAPI", employee_ids: set[int]) -> None:
@@ -362,22 +401,196 @@ def _assert_voucher_post_path_not_blocked_by_create_guard() -> None:
 _assert_voucher_post_path_not_blocked_by_create_guard()
 
 
-def _sanitize_tripletex_get_params(path: str, params: Optional[dict[str, Any]]) -> dict[str, Any]:
-    """Avoid 400 on fields= — e.g. GET /travelExpense/paymentType does not expose **name** (TravelPaymentTypeDTO)."""
+def _sanitize_invoice_list_fields_dict(p: dict[str, Any]) -> dict[str, Any]:
+    """
+    GET /invoice (list) and **GET /invoice/{id}** (detail): **InvoiceDTO** rejects **dueDate**, **isPaid**,
+    **amountIncludingVat**, **paid** in the **`fields`** query filter (detail returns 400 *Illegal field*, same class as list).
+    Map **dueDate** → **invoiceDueDate**.
+    """
+    fields = p.get("fields")
+    if not isinstance(fields, str) or not fields.strip():
+        return p
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in fields.split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        if tok == "dueDate":
+            tok = "invoiceDueDate"
+        if tok in ("isPaid", "amountIncludingVat", "paid"):
+            continue
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    p["fields"] = ",".join(out)
+    return p
+
+
+def _sanitize_activity_fields_dict(p: dict[str, Any]) -> None:
+    """**ActivityDTO** `fields` filter rejects **isInactive** (400 *Illegal field*) on list and detail GET."""
+    fields = p.get("fields")
+    if not isinstance(fields, str) or not fields.strip():
+        return
+    banned = {"isInactive"}
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in fields.split(","):
+        tok = raw.strip()
+        if not tok or tok in banned:
+            continue
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    p["fields"] = ",".join(out)
+
+
+def _ledger_account_3400_fee_credit_quirk_note(
+    number_raw: Any, account_row: Optional[dict[str, Any]]
+) -> Optional[str]:
+    """
+    Some tenants map **3400** to **subsidy** / **tilskudd** accounts — a bad **credit** for **purregebyr** if the grader
+    expects **fee income**. Surfaces as `_toolNote` so the model can **GET** another GL (e.g. **8040**/**8050**) by name.
+    """
+    if account_row is None or number_raw is None:
+        return None
+    if str(number_raw).strip() != "3400":
+        return None
+    nm = (account_row.get("name") or "").lower()
+    if "tilskudd" not in nm and "offentlig" not in nm:
+        return None
+    return (
+        "**Chart quirk:** **3400** resolves to a **tilskudd** / **offentlig**-style account here — often **wrong** as "
+        "**credit** for **purregebyr** / **reminder fee** **inntekt**. **`GET /ledger/account?number=…&fields=id,number,name`** "
+        "for a **gebyr**/**provision**/**service** income account the task implies (e.g. **8040**, **8050**) until **`name`** fits."
+    )
+
+
+def _apply_tripletex_get_sanitizers(
+    path: str, params: Optional[dict[str, Any]]
+) -> tuple[dict[str, Any], list[str]]:
+    """Normalize query params for known 400-prone GETs; return (params, human-facing notes for tools/logs)."""
+    notes: list[str] = []
     p = dict(params or {})
     path_only = urlparse(path).path.rstrip("/")
-    if path_only != "/travelExpense/paymentType":
-        return p
-    fields = p.get("fields")
-    if not isinstance(fields, str):
-        return p
-    parts = [x.strip() for x in fields.split(",") if x.strip()]
-    if not parts:
-        return p
-    allowed = {"id"}
-    keep = [x for x in parts if x in allowed]
-    p["fields"] = ",".join(keep) if keep else "id"
-    return p
+
+    if path_only == "/invoice":
+        before = p.get("fields") if isinstance(p.get("fields"), str) else None
+        _sanitize_invoice_list_fields_dict(p)
+        after = p.get("fields") if isinstance(p.get("fields"), str) else None
+        if before is not None and after != before:
+            notes.append(
+                "GET /invoice list: adjusted `fields` — use **invoiceDueDate** (not **dueDate**); "
+                "dropped **isPaid**, **amountIncludingVat**, **paid** (invalid on InvoiceDTO list)."
+            )
+
+    inv_parts = [x for x in path_only.split("/") if x]
+    if (
+        len(inv_parts) == 2
+        and inv_parts[0] == "invoice"
+        and inv_parts[1].isdigit()
+    ):
+        before = p.get("fields") if isinstance(p.get("fields"), str) else None
+        _sanitize_invoice_list_fields_dict(p)
+        after = p.get("fields") if isinstance(p.get("fields"), str) else None
+        if before is not None and after != before:
+            notes.append(
+                "GET /invoice/{id}: adjusted `fields` — use **invoiceDueDate** (not **dueDate**); "
+                "dropped **isPaid**, **amountIncludingVat**, **paid** (invalid **fields** filter on InvoiceDTO detail)."
+            )
+
+    if path_only == "/travelExpense/paymentType":
+        fields = p.get("fields")
+        if isinstance(fields, str):
+            parts = [x.strip() for x in fields.split(",") if x.strip()]
+            allowed = {"id"}
+            keep = [x for x in parts if x in allowed]
+            new_f = ",".join(keep) if keep else "id"
+            if new_f != fields:
+                notes.append(
+                    "GET /travelExpense/paymentType: reduced `fields` to **id** only (**name** is not a valid filter)."
+                )
+            p["fields"] = new_f
+
+    if path_only == "/salary/type":
+        fields = p.get("fields")
+        if isinstance(fields, str):
+            parts = [x.strip() for x in fields.split(",") if x.strip()]
+            allowed = {"id", "name"}
+            keep = [x for x in parts if x in allowed]
+            new_f = ",".join(keep) if keep else "id,name"
+            if new_f != fields:
+                notes.append(
+                    "GET /salary/type: reduced `fields` — **SalaryTypeDTO** allows **id** and **name** only "
+                    "(**displayName** etc. → **400** *Illegal field*)."
+                )
+            p["fields"] = new_f
+
+    act_parts = [x for x in path_only.split("/") if x]
+    if len(act_parts) >= 1 and act_parts[0] == "activity":
+        if len(act_parts) == 1 or (len(act_parts) == 2 and act_parts[1].isdigit()):
+            before = p.get("fields") if isinstance(p.get("fields"), str) else None
+            _sanitize_activity_fields_dict(p)
+            after = p.get("fields") if isinstance(p.get("fields"), str) else None
+            if before is not None and after != before:
+                notes.append(
+                    "GET /activity: dropped **isInactive** from `fields` — not a valid **ActivityDTO** filter (**400**)."
+                )
+
+    return p, notes
+
+
+def _supplier_party_id_from_postings(lines: list[dict[str, Any]]) -> Optional[int]:
+    """
+    **Customer** and **supplier** share the same **party** id in Tripletex. Some tenants return **422**
+    *«Kunde mangler»* / **`postings.customer.id`** on voucher create when debit lines lack **`customer`**
+    even though the credit line has **`supplier: {id}`** — copy that id onto positive **amountGross** lines.
+    Prefer **supplier** on a **negative** line (AP / credit) when present.
+    """
+    any_id: Optional[int] = None
+    neg_id: Optional[int] = None
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        sup = line.get("supplier")
+        if not isinstance(sup, dict) or sup.get("id") is None:
+            continue
+        try:
+            sid = int(sup["id"])
+        except (TypeError, ValueError):
+            continue
+        any_id = sid
+        ag = line.get("amountGross")
+        try:
+            agf = float(ag) if ag is not None else None
+        except (TypeError, ValueError):
+            agf = None
+        if agf is not None and agf < 0:
+            neg_id = sid
+    return neg_id if neg_id is not None else any_id
+
+
+def _merge_customer_into_positive_posting_lines(
+    lines: list[dict[str, Any]],
+    customer: dict[str, Any],
+) -> None:
+    """
+    Tenants often require **customer** on **debit** postings to **kundefordringer (15xx)** (e.g. reminder fees).
+    Apply **customer** to lines with **amountGross > 0** that omit **customer** (credit lines stay unchanged).
+    """
+    if not isinstance(customer, dict) or customer.get("id") is None:
+        return
+    cust = dict(customer)
+    for line in lines:
+        if not isinstance(line, dict) or line.get("customer") is not None:
+            continue
+        ag = line.get("amountGross")
+        try:
+            agf = float(ag) if ag is not None else None
+        except (TypeError, ValueError):
+            agf = None
+        if agf is not None and agf > 0:
+            line["customer"] = dict(cust)
 
 
 def _voucher_id_from_create_response(resp: dict[str, Any]) -> Optional[Any]:
@@ -389,38 +602,58 @@ def _voucher_id_from_create_response(resp: dict[str, Any]) -> Optional[Any]:
     return None
 
 
+def _coerce_accounting_dimension_value_id(raw: Any) -> Optional[int]:
+    """Dimension **value** id from `{id: N}`, bare int, or list element."""
+    if isinstance(raw, dict):
+        x = raw.get("id")
+        if isinstance(x, int):
+            return x
+        if isinstance(x, str) and x.strip().isdigit():
+            return int(x.strip())
+    if isinstance(raw, int):
+        return raw
+    return None
+
+
 def _normalize_voucher_posting_line(line: dict[str, Any]) -> dict[str, Any]:
     """
-    Map legacy freeAccountingDimension* to accountingDimensionValues for /postings.
-    Some tenants accept **amount** on Posting, others **amountGross** — send both when **amountGross** is set
-    (same numeric value) so one-step voucher create sees a recognized line amount.
+    **Posting** on **POST /ledger/voucher** (inline + hybrid first line + /postings sub-resource):
+    OpenAPI uses **`freeAccountingDimension1..3`** (`{id: dimensionValueId}`), not **`accountingDimensionValues`**
+    — NM sandbox returns **422** *«Feltet eksisterer ikke i objektet»* on **`accountingDimensionValues`**.
+    Accept **`accountingDimensionValues`** or **`freeAccountingDimension*`** from the model; emit **only** **`freeAccountingDimension1..3`**.
+    Some tenants accept **amount** on Posting, others **amountGross** — send both when **amountGross** is set.
     """
     out = dict(line)
-    extras: list[dict[str, int]] = []
-    for key in (
-        "freeAccountingDimension1",
-        "freeAccountingDimension2",
-        "freeAccountingDimension3",
-    ):
+    collected: list[int] = []
+
+    for key in ("freeAccountingDimension1", "freeAccountingDimension2", "freeAccountingDimension3"):
         if key not in out:
             continue
         raw = out.pop(key)
-        if isinstance(raw, dict) and isinstance(raw.get("id"), int):
-            extras.append({"id": raw["id"]})
-        elif isinstance(raw, int):
-            extras.append({"id": raw})
-    if not extras:
-        pass
-    else:
-        existing = out.get("accountingDimensionValues")
-        if isinstance(existing, list):
-            out["accountingDimensionValues"] = list(existing) + extras
-        else:
-            out["accountingDimensionValues"] = extras
+        vid = _coerce_accounting_dimension_value_id(raw)
+        if vid is not None:
+            collected.append(vid)
+
+    adv = out.pop("accountingDimensionValues", None)
+    if isinstance(adv, list):
+        for item in adv:
+            vid = _coerce_accounting_dimension_value_id(item)
+            if vid is not None:
+                collected.append(vid)
+
+    out.pop("accountingDimensionValues", None)
+    slot_keys = ("freeAccountingDimension1", "freeAccountingDimension2", "freeAccountingDimension3")
+    for idx, vid in enumerate(collected[:3]):
+        out[slot_keys[idx]] = {"id": vid}
 
     ag = out.get("amountGross")
     if ag is not None:
         out["amount"] = ag
+        # Tripletex validates amountGross vs amountGrossCurrency (same tenant as sandbox NM).
+        if out.get("amountGrossCurrency") is None:
+            out["amountGrossCurrency"] = ag
+        if out.get("amountCurrency") is None:
+            out["amountCurrency"] = ag
     return out
 
 
@@ -450,7 +683,14 @@ def _post_voucher_line(
         )
         ag = line_body.get("amountGross")
         if status == 422 and isinstance(ag, (int, float)):
-            flipped = {**line_body, "amountGross": -float(ag), "amount": -float(ag)}
+            neg = -float(ag)
+            flipped = {
+                **line_body,
+                "amountGross": neg,
+                "amount": neg,
+                "amountGrossCurrency": neg,
+                "amountCurrency": neg,
+            }
             _agent_print(
                 f"  ℹ️  Retrying row {row_idx + 1} with negated amountGross "
                 f"(was {ag} → {flipped['amountGross']}; debit positive / credit negative)."
@@ -498,6 +738,29 @@ def _voucher_422_detail_lower(exc: requests.HTTPError) -> str:
         return (exc.response.text or "").lower()
     except Exception:
         return ""
+
+
+def _voucher_http_error_body_preview(exc: requests.HTTPError, limit: int = 1500) -> str:
+    """Log raw JSON/text from Tripletex 4xx (for sandbox / test_sandbox diagnosis)."""
+    try:
+        if exc.response is None:
+            return "(no response)"
+        return _log_preview((exc.response.text or "").strip(), limit)
+    except Exception:
+        return "(could not read body)"
+
+
+def _voucher_http_error_body_full(exc: requests.HTTPError, max_chars: int = 65536) -> str:
+    """Unabbreviated response text for voucher routing diagnosis (cap avoids huge logs)."""
+    try:
+        if exc.response is None:
+            return "(no response)"
+        raw = (exc.response.text or "").strip()
+        if len(raw) <= max_chars:
+            return raw
+        return raw[:max_chars] + f"... [truncated {len(raw) - max_chars} chars]"
+    except Exception:
+        return "(could not read body)"
 
 
 def _voucher_422_is_systemgenererte(detail: str) -> bool:
@@ -548,9 +811,10 @@ def _finalize_voucher_create(
     }
     if send_to_ledger:
         line_results = posting_responses or []
-        if posting_mode == "two_step_subresource" and _voucher_line_results_have_http_error(
-            line_results
-        ):
+        if posting_mode in (
+            "two_step_subresource",
+            "hybrid_first_line_then_subresource",
+        ) and _voucher_line_results_have_http_error(line_results):
             out["sendToLedger_skipped"] = "one or more posting lines failed"
         else:
             try:
@@ -614,6 +878,65 @@ def _post_voucher_shell_then_posting_lines(
     )
 
 
+def _post_voucher_hybrid_first_line_then_subresource(
+    api: "TripletexAPI",
+    shell_base: dict[str, Any],
+    norm_lines: list[dict[str, Any]],
+    send_to_ledger: bool,
+) -> Optional[dict[str, Any]]:
+    """
+    When **full** inline **postings** return **422**, many NM tenants still **reject** an **empty** shell
+    (*«Et bilag kan ikke registreres uten posteringer»*). Try **one** line in the first **POST**, then
+    **POST /ledger/voucher/{id}/postings** for the rest — **before** empty-shell two-step.
+    Returns **None** if the first-line **POST** is not successful (**422** etc.) so the caller can fall back.
+    """
+    if len(norm_lines) < 2:
+        return None
+    first_line = dict(norm_lines[0])
+    body_hybrid = {**shell_base, "postings": [first_line]}
+    try:
+        _agent_print(
+            "  ℹ️  voucher **hybrid**: first line inline, rest via **`/ledger/voucher/{id}/postings`** "
+            "(avoids empty-shell **422** on tenants that require non-empty **postings** on create)."
+        )
+        voucher_json = api.post("/ledger/voucher?sendToLedger=false", body_hybrid)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 422:
+            _agent_print(
+                "  ℹ️  voucher hybrid first-line POST 422 FULL body — try empty-shell two-step.\n"
+                f"     {_voucher_http_error_body_full(e)}"
+            )
+            return None
+        raise
+    vid = _voucher_id_from_create_response(voucher_json)
+    if vid is None:
+        return {
+            "error": "hybrid: first-line POST OK but could not read voucher id",
+            "voucher_response": voucher_json,
+            "posting_mode": "hybrid_first_line_then_subresource",
+        }
+
+    line_results: list[Any] = []
+    for row_idx, p in enumerate(norm_lines[1:], start=1):
+        line_body = dict(p)
+        if "row" not in line_body:
+            line_body = {**line_body, "row": row_idx + 1}
+        sub_path = f"/ledger/voucher/{vid}/postings"
+        _agent_print(
+            f"  📤 voucher hybrid POST {sub_path} row {line_body.get('row')}: "
+            f"{_log_preview(json.dumps(line_body, ensure_ascii=False), 4096)}"
+        )
+        line_results.append(_post_voucher_line(api, vid, line_body, row_idx))
+
+    return _finalize_voucher_create(
+        api,
+        voucher_json,
+        send_to_ledger=send_to_ledger,
+        posting_mode="hybrid_first_line_then_subresource",
+        posting_responses=line_results,
+    )
+
+
 def post_voucher_two_step(
     api: "TripletexAPI",
     *,
@@ -631,12 +954,42 @@ def post_voucher_two_step(
     **4)** Last resort: empty shell + POST /ledger/voucher/{id}/postings per line
     """
     shell_base: dict[str, Any] = {"date": date, "description": description}
+    postings_customer: Optional[dict[str, Any]] = None
     if shell_extras:
         for k, v in shell_extras.items():
-            if k != "postings":
-                shell_base[k] = v
+            if k in ("postings", "customer"):
+                if k == "customer" and isinstance(v, dict):
+                    postings_customer = v
+                continue
+            shell_base[k] = v
+
+    def _positive_debit_lines_missing_customer(lines: list[dict[str, Any]]) -> int:
+        n = 0
+        for li in lines:
+            if not isinstance(li, dict) or li.get("customer") is not None:
+                continue
+            ag = li.get("amountGross")
+            try:
+                agf = float(ag) if ag is not None else None
+            except (TypeError, ValueError):
+                agf = None
+            if agf is not None and agf > 0:
+                n += 1
+        return n
 
     norm_lines, _ = _normalize_postings_lines(postings_lines)
+    if postings_customer is not None:
+        _merge_customer_into_positive_posting_lines(norm_lines, postings_customer)
+    party_sid = _supplier_party_id_from_postings(norm_lines)
+    if party_sid is not None:
+        missing_cust = _positive_debit_lines_missing_customer(norm_lines)
+        if missing_cust:
+            _merge_customer_into_positive_posting_lines(norm_lines, {"id": party_sid})
+            if _positive_debit_lines_missing_customer(norm_lines) < missing_cust:
+                _agent_print(
+                    "  ℹ️  voucher: set **customer: {id}** on **debit** lines from **supplier** party "
+                    "(avoids **422** *Kunde mangler* when AP line had **supplier** only)."
+                )
     full_body: dict[str, Any] = {**shell_base, "postings": norm_lines}
 
     # --- 1) One-step: full postings + ?sendToLedger=false ---
@@ -655,6 +1008,10 @@ def post_voucher_two_step(
     except requests.HTTPError as e:
         if e.response.status_code != 422:
             raise
+        _agent_print(
+            "  ℹ️  voucher one-step (`?sendToLedger=false`) 422 FULL body (routing input):\n"
+            f"     {_voucher_http_error_body_full(e)}"
+        )
         d1 = _voucher_422_detail_lower(e)
 
     if _voucher_422_is_systemgenererte(d1):
@@ -680,6 +1037,10 @@ def post_voucher_two_step(
     except requests.HTTPError as e2:
         if e2.response.status_code != 422:
             raise
+        _agent_print(
+            "  ℹ️  voucher no-query POST `/ledger/voucher` 422 FULL body (routing input):\n"
+            f"     {_voucher_http_error_body_full(e2)}"
+        )
 
     # --- 3) Singular top-level key "posting" (some OpenAPI / proxy stacks differ) ---
     _agent_print("  ℹ️  attempt 2b: trying singular 'posting' field name")
@@ -699,16 +1060,52 @@ def post_voucher_two_step(
     except requests.HTTPError as e3:
         if e3.response.status_code != 422:
             raise
+        _agent_print(
+            "  ℹ️  voucher singular `posting` POST 422 FULL body (routing input):\n"
+            f"     {_voucher_http_error_body_full(e3)}"
+        )
         d3 = _voucher_422_detail_lower(e3)
         _agent_print(
-            "  ℹ️  voucher: singular `posting` still 422 — two-step shell + /postings (last resort). "
+            "  ℹ️  voucher: singular `posting` still 422 — hybrid first-line / empty-shell two-step (last resorts). "
             f"(detail preview: {_log_preview(d3, 200)})"
         )
 
+    # --- 3.5) Hybrid: first posting inline, remaining lines via sub-resource (before empty shell) ---
+    # Rotate which line is posted inline first — some tenants accept one ordering but not another.
+    if len(norm_lines) >= 2:
+        for k in range(len(norm_lines)):
+            rotated = norm_lines[k:] + norm_lines[:k]
+            hybrid_out = _post_voucher_hybrid_first_line_then_subresource(
+                api, shell_base, rotated, send_to_ledger
+            )
+            if hybrid_out is not None:
+                return hybrid_out
+
     # --- 4) Last resort: empty shell + /postings sub-resource ---
+    # Use **norm_lines** (includes shell_extras **customer** merge) — not raw **postings_lines**.
     return _post_voucher_shell_then_posting_lines(
-        api, shell_base, postings_lines, send_to_ledger
+        api, shell_base, norm_lines, send_to_ledger
     )
+
+
+def _tripletex_get_path_is_session_cacheable(path_only: str) -> bool:
+    """Safe per-`/solve` GET cache: static chart / type lists — not invoices, vouchers, orders."""
+    for prefix in (
+        "/ledger/account",
+        "/invoice/paymentType",
+        "/travelExpense/paymentType",
+        "/salary/type",
+        "/ledger/vatType",
+    ):
+        if path_only == prefix or path_only.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def _get_params_cache_key(params: Optional[dict[str, Any]]) -> str:
+    if not params:
+        return "{}"
+    return json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
 
 
 class TripletexAPI:
@@ -717,8 +1114,64 @@ class TripletexAPI:
         self.session  = requests.Session()
         self.session.auth = ("0", session_token)   # Basic Auth: user=0, pass=token
         self.session.headers["Content-Type"] = "application/json"
+        # Retry **GET/PUT/DELETE** only — many **POST** paths (e.g. /supplierInvoice) return **persistent** HTTP 500;
+        # urllib3 would burn all retries and raise **RetryError** before our **execute_tool** 500/1000 handler runs.
+        _retry = Retry(
+            total=3,
+            backoff_factor=0.8,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET", "PUT", "DELETE"],
+        )
+        _adapter = HTTPAdapter(max_retries=_retry)
+        self.session.mount("https://", _adapter)
+        self.session.mount("http://", _adapter)
+        # Per TripletexAPI instance (one per POST /solve) — duplicate POST /supplierInvoice guard.
+        self.supplier_invoice_500_seen: set[str] = set()
         # Per /solve session: travel cost categories by id (from GET /travelExpense/costCategory/{id})
         self._travel_cost_category_cache: dict[int, dict[str, Any]] = {}
+        # Idempotent GETs (account by number, paymentType lists, vatType) — reduces duplicate 4xx-prone spam.
+        self._get_response_cache: dict[str, Any] = {}
+        # Successful PUT /customer/{id} with identical JSON — skip repeat HTTP (tenant quirk loops).
+        self._put_customer_success_cache: dict[str, dict[str, Any]] = {}
+        # Last GET sanitization messages (consumed by execute_tool for _toolNote).
+        self._last_get_tool_notes: list[str] = []
+
+    def _get_session_cache_active(self) -> bool:
+        return os.environ.get("TRIPLETEX_GET_CACHE", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+    def _invalidate_ledger_account_get_cache(self) -> None:
+        """After **PUT /ledger/account/{id}**, drop cached **GET /ledger/account** rows (bank number etc.)."""
+        if not self._get_session_cache_active():
+            return
+        drop = [
+            k
+            for k in list(self._get_response_cache.keys())
+            if k.split("\n", 1)[0].startswith("/ledger/account")
+        ]
+        for k in drop:
+            self._get_response_cache.pop(k, None)
+
+    @staticmethod
+    def _ledger_account_mutation_path(path: str) -> bool:
+        """True for **/ledger/account** list or **/ledger/account/{numeric id}** only."""
+        parts = [p for p in urlparse(path).path.split("/") if p]
+        if len(parts) < 2 or parts[0] != "ledger" or parts[1] != "account":
+            return False
+        if len(parts) == 2:
+            return True
+        return parts[2].isdigit()
+
+    @staticmethod
+    def _put_customer_dedupe_key(path: str, body: dict[str, Any]) -> Optional[str]:
+        parts = [p for p in urlparse(path).path.split("/") if p]
+        if len(parts) != 2 or parts[0] != "customer" or not parts[1].isdigit():
+            return None
+        return f"{urlparse(path).path.rstrip('/')}\n{json.dumps(body, sort_keys=True, separators=(',', ':'), default=str)}"
 
     def _travel_cost_category_path_id(self, path_only: str) -> Optional[int]:
         prefix = "/travelExpense/costCategory/"
@@ -768,8 +1221,24 @@ class TripletexAPI:
             if detail:
                 values[i] = {**row, **detail}
 
+    def pop_get_tool_notes(self) -> list[str]:
+        n = self._last_get_tool_notes
+        self._last_get_tool_notes = []
+        return n
+
     def get(self, path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        safe_params = _sanitize_tripletex_get_params(path, params)
+        safe_params, san_notes = _apply_tripletex_get_sanitizers(path, params)
+        self._last_get_tool_notes = list(san_notes)
+        for note in san_notes:
+            _agent_print(f"  ℹ️  {note}")
+        path_only = urlparse(path).path.rstrip("/")
+        cache_off = not self._get_session_cache_active()
+        cache_key: Optional[str] = None
+        if not cache_off and _tripletex_get_path_is_session_cacheable(path_only):
+            cache_key = f"{path}\n{_get_params_cache_key(safe_params)}"
+            cached = self._get_response_cache.get(cache_key)
+            if cached is not None:
+                return json.loads(json.dumps(cached))
         r = self.session.get(
             f"{self.base_url}{path}",
             params=safe_params,
@@ -778,7 +1247,6 @@ class TripletexAPI:
         r.raise_for_status()
         result = _response_json(r)
 
-        path_only = urlparse(path).path.rstrip("/")
         vid = self._travel_cost_category_path_id(path_only)
         if vid is not None:
             inner = result.get("value") if isinstance(result, dict) else None
@@ -786,6 +1254,11 @@ class TripletexAPI:
                 self._travel_cost_category_cache[int(inner["id"])] = inner
         elif path_only == "/travelExpense/costCategory" and isinstance(result, dict):
             self._maybe_enrich_travel_cost_category_list(result)
+
+        if cache_key is not None and isinstance(result, dict):
+            self._get_response_cache[cache_key] = json.loads(json.dumps(result))
+            while len(self._get_response_cache) > 200:
+                self._get_response_cache.pop(next(iter(self._get_response_cache)), None)
 
         return result
 
@@ -806,9 +1279,21 @@ class TripletexAPI:
         return _response_json(r)
 
     def put(self, path: str, body: dict) -> dict[str, Any]:
+        dup_key = self._put_customer_dedupe_key(path, body)
+        if dup_key is not None and dup_key in self._put_customer_success_cache:
+            _agent_print(
+                "  ℹ️  **PUT /customer/{id}** duplicate (same body as an earlier **200** this /solve) — "
+                "returning cached JSON, **no** second HTTP call."
+            )
+            return json.loads(json.dumps(self._put_customer_success_cache[dup_key]))
         r = self.session.put(f"{self.base_url}{path}", json=body, timeout=30)
         r.raise_for_status()
-        return _response_json(r)
+        out = _response_json(r)
+        if dup_key is not None:
+            self._put_customer_success_cache[dup_key] = out
+        if self._ledger_account_mutation_path(path):
+            self._invalidate_ledger_account_get_cache()
+        return out
 
     def put_action(
         self,
@@ -824,7 +1309,10 @@ class TripletexAPI:
         else:
             r = self.session.put(url, params=p, json=body, timeout=30)
         r.raise_for_status()
-        return _response_json(r)
+        out = _response_json(r)
+        if self._ledger_account_mutation_path(path):
+            self._invalidate_ledger_account_get_cache()
+        return out
 
     def delete(self, path: str) -> dict[str, Any]:
         r = self.session.delete(f"{self.base_url}{path}", timeout=30)
@@ -851,10 +1339,11 @@ TOOLS = [
             "GET /product (list): query **`name`** (substring / \"Containing\") and/or **`productNumber`** (when you have the SKU); "
             "use **`fields=id,name,number`** (or minimal set) — **before** POST /product, look up existing rows and **reuse** **id**.\n"
             "GET /ledger/voucher (list/search): requires **dateFrom** and **dateTo**; **dateTo** must be strictly after **dateFrom**. **`VoucherDTO`** **fields** filter: use **`number`** (bilagsnr) — **not** **`voucherNumber`** or **`amount`** (API **400**). Totals live on **`postings`** — omit **`postings`** on the list to save payload; **`execute_tool`** **strips** any embedded **`postings`** and returns **`postingsCount`** (**`null`** when **`postings`** were omitted — **not** zero) + **`_toolNote`** — **`GET /ledger/voucher/{id}`** for lines/amounts. **Pagination:** **`from`** / **`count`**. **Audit/correction** → **SYSTEM_PROMPT** **Ledger audit / error correction**.\n"
+            "**GET /ledger/voucher/{id}** (single bilag): without nested **`postings(…)`** in **`fields`**, Tripletex often returns **`postings`** as **`{id, url}`** stubs only — **`execute_tool`** **auto-appends** **`postings(id,row,amountGross,amountGrossCurrency,amount,account(id,number,name))`** when your **`fields`** omits **`postings(`**. **Do not** add bare **`postings`** in **`fields`** — it **duplicates** the nested filter and returns **400**; the runtime **strips** bare **`postings`** before appending. For **`tripletex_post_voucher`** lines, set **`amountGrossCurrency`** (and **`amountCurrency`**) equal to **`amountGross`** when booking in company currency — see **`_normalize_voucher_posting_line`**.\n"
             "CRITICAL: path /invoice (no id) = list endpoint. Params MUST include invoiceDateFrom AND invoiceDateTo "
             "(YYYY-MM-DD) every time — even alongside customerId, fields, pagination. Missing dates → 422. "
-            "Example: {customerId: X, invoiceDateFrom: '2000-01-01', invoiceDateTo: '2099-12-31', fields: 'id,invoiceNumber,invoiceDate,amountExcludingVat'}. "
-            "Do NOT request isPaid, dueDate, amountIncludingVat, or paid — they are not valid invoice list fields.\n"
+            "Example: {customerId: X, invoiceDateFrom: '2000-01-01', invoiceDateTo: '2099-12-31', fields: 'id,invoiceNumber,invoiceDate,amountExcludingVat,invoiceDueDate,customer'}. "
+            "For **overdue** triage, include **`invoiceDueDate`** in **`fields`** — **not** **`dueDate`** (illegal on **InvoiceDTO** list **and** **GET /invoice/{id}**; **`TripletexAPI.get`** maps **`dueDate`→`invoiceDueDate`** and strips **isPaid** / **amountIncludingVat** / **paid**).\n"
             "**GET /supplierInvoice** (list): same rule — **invoiceDateFrom** and **invoiceDateTo** (YYYY-MM-DD) are **required**. "
             "Optional **kid**, **supplierId**, **invoiceNumber**. Use **fields** to include **outstandingAmount**, **kidOrReceiverReference**, **amount**, **invoiceDate** when reconciling payments.\n"
             "**Travel cost categories:** **`GET /travelExpense/costCategory`** may return **id-only** rows; the server **enriches** each with **`GET /travelExpense/costCategory/{id}`** (details cached for this `/solve` session). You may still call **`/{id}`** yourself; use **displayName** / **description** to pick **Fly**, **Taxi**, **Hotell**, etc. per SYSTEM_PROMPT.\n"
@@ -871,7 +1360,8 @@ TOOLS = [
                         "Query params. If path is /invoice (list): always include invoiceDateFrom and invoiceDateTo "
                         "(YYYY-MM-DD) in addition to any customerId/fields/from/count. "
                         "Example: {customerId: X, invoiceDateFrom: '2000-01-01', invoiceDateTo: '2099-12-31', "
-                        "fields: 'id,invoiceNumber,invoiceDate,amountExcludingVat'}. Never use isPaid, dueDate, amountIncludingVat, paid in fields."
+                        "fields: 'id,invoiceNumber,invoiceDate,amountExcludingVat,invoiceDueDate,customer'}. "
+                        "Never use isPaid, amountIncludingVat, paid on **/invoice** list **or** **/invoice/{id}**; use invoiceDueDate (not dueDate) — dueDate is auto-mapped."
                     ),
                 },
             },
@@ -894,8 +1384,8 @@ TOOLS = [
             "**Before** POST, **GET /product** with **`name`** and/or **`productNumber`** + **`fields`** — if a row matches, **reuse** **id** (no POST). "
             "If **422** **«Produktnummeret … er i bruk»** or **«Produktnavnet … er allerede registrert»**, **do not** burn calls on invented POST bodies — **GET /product**, **reuse** existing **id**; only if still no row, **retry POST** **without** **`number`** (duplicate-number case).\n"
             "POST /department: body **{name: \"...\"}** — multiple departments → **separate POST** per name (see SYSTEM_PROMPT).\n"
-            "POST /employee: requires **userType** (e.g. STANDARD) and **department: {id}**; use **POST /employee/employment** for startDate / tax — not nested employmentDetails on /employee. **Always** **`GET /employee?email=…&fields=id,firstName,lastName`** **before** **POST /employee** — reuse **`id`** if found (avoid duplicate-email **422**). See SYSTEM_PROMPT **Create employee Step 0**.\n"
-            "Payroll: **before** **POST /employee/employment**, **GET /employee/{id}?fields=dateOfBirth** — if **null**, **PUT /employee/{id}** **`{dateOfBirth: …}`**. **POST /employee/employment**: use **minimal** body first — **`{employee: {id}, startDate}`** only (see SYSTEM_PROMPT); **no** auto-**division**. If **404** with a larger body, **`execute_tool`** retries once with **only** **`employee`+`startDate`**. Set **division** via **PUT /employee/employment/{id}** after create if needed.\n"
+            "POST /employee: requires **userType** (e.g. STANDARD) and **department: {id}**; use **POST /employee/employment** for startDate / tax — not nested employmentDetails on /employee. **Always** **`GET /employee?email=…&fields=id,firstName,lastName`** **before** **POST /employee** with a **non-empty** email from the task/PDF — **`execute_tool`** **rejects** **`email:\"\"`**. See SYSTEM_PROMPT **Create employee Step 0**.\n"
+            "Payroll: **before** **POST /employee/employment**, **GET /employee/{id}?fields=dateOfBirth** — if **null**, **PUT /employee/{id}** **`{dateOfBirth: …}`**. **POST /employee/employment**: model sends **`{employee, startDate}`** — **`execute_tool`** tries **`division:{id:1}`**, then **2**, then **3** on **POST** (**HTTP 404** → next); then **minimal** body. **Non-minimal** POST **404** → strip to **`employee`+`startDate`**. **Stillingsprosent** → **`POST /employee/employment/details`**, **not** **`PUT …/employment/{id}`** with **`percentageOfFullTimeEquivalent`** (see SYSTEM_PROMPT).\n"
             "POST /project: **startDate** is required (422 if missing); resolve **projectManager** via GET /employee with email filter if needed.\n"
             "POST /timesheet/entry: **project**, **activity**, **employee**, **date**, **hours** (see SYSTEM_PROMPT).\n"
             "Invoice bank (before **:invoice**): **GET /ledger/account** **`number=1920`**, **`fields=id,number,bankAccountNumber`** → **`tripletex_put` `PUT /ledger/account/{id}`** body **`{bankAccountNumber: \"86011117947\"}`** only — **do not** **POST** **1921**.\n"
@@ -917,7 +1407,7 @@ TOOLS = [
             "**Supplier invoice payment:** **POST** `/supplierInvoice/{invoiceId}/:addPayment` — **this tool** with **body** **`{}`** and **params** per OpenAPI: "
             "**paymentType** (required; **0** = use last type for vendor when combined with tenant setup), **amount**, **paymentDate**, "
             "**partialPayment: true** when registering a **partial** payment, optional **kidOrReceiverReference**, **useDefaultPaymentType**.\n"
-            "**POST /employee/employment**: **minimal** **`{employee: {id}, startDate}`** first — **no** runtime **division** injection; **404** → automatic one retry stripped to **employee**+**startDate** only.\n"
+            "**POST /employee/employment**: for **`{employee, startDate}`** only, runtime tries **`division:{id:1..3}`** on **POST** (**404** → next id, then minimal). **Non-minimal** body **404** → strip to **employee**+**startDate**. **`GET /salary/type`**: **`fields`** **id,name** only — **`displayName`** **400** (sanitized in **`TripletexAPI.get`**).\n"
             "**POST /salary/transaction**: optional **`params`** e.g. **`{generateTaxDeduction: true}`**. Each **`payslips[].specifications[]`** line with **`amount`** must include **`count`** and **`rate`** (non-null) — e.g. **`count: 1`**, **`rate`** = same as **`amount`** for monthly fixed pay; **`execute_tool`** auto-fills missing **`count`/`rate`** from **`amount`**.\n"
             "Returns the created resource JSON for the requested path."
         ),
@@ -938,12 +1428,17 @@ TOOLS = [
         "name": "tripletex_post_voucher",
         "description": (
             "**Always use this for ledger / journal vouchers** (manual postings). **Tries one-step first**, then **two-step** only if the tenant requires it:\n"
+            "**Customer on debit lines (purring / rappel / kundefordring):** many tenants require **`customer: {id}`** on **debit** postings (**`amountGross` > 0**) to **kundefordringer (15xx)** — **422** *«Kunde mangler»* if omitted. Pass **`customer`** at the tool root (or **`shell_extras.customer`**) — the runtime copies it onto **positive-amount** lines that lack **`customer`**. Match the **invoice’s** customer for reminder fees.\n"
+            "**Supplier invoice voucher fallback:** if **`supplier: {id}`** is only on the **credit** line, the runtime may copy that **party** **`id`** as **`customer`** on **debit** lines (same **`id`** in Tripletex) — or pass root **`supplier: {id}`** when **`customer`** is omitted.\n"
             "**A)** **POST /ledger/voucher?sendToLedger=false** with the **full** voucher JSON including **`postings: [...]`** (all lines in one body). **200** → done (fewer HTTP calls, avoids *«uten posteringer»* on tenants that reject an **empty** shell).\n"
             "**B)** If **A** returns **422** *«uten posteringer»* / *«kan ikke registreres uten posteringer»*, retry **POST /ledger/voucher** with the **same body** but **no** **`sendToLedger`** query.\n"
-            "**C)** If **A** returns **422** mentioning **systemgenererte** (or **B** still **422**), fall back: **POST** shell **`postings: []`** + **`sendToLedger=false`**, then **POST /ledger/voucher/{id}/postings** once **per line** (single object per request) — **`row`**, **`account: {id}`**, **`amountGross`**, etc.\n"
+            "**C)** If **A**/**B** still **422**, **hybrid**: **POST** with **`postings: [one line]`** then **POST /ledger/voucher/{id}/postings** for the rest — the runtime **rotates** which line is inline first (ordering quirks). **Before** **D**.\n"
+            "**D)** Last resort: **POST** shell **`postings: []`** + **`sendToLedger=false`**, then **POST /ledger/voucher/{id}/postings** per line.\n"
+            "**Bank accounts:** **`execute_tool`** blocks postings to **`isBankAccount`** GL (**1920**, …) — Tripletex rejects them on manual vouchers; use **8060/8160** + **1500/2900** for valutaeffekter. Env **`TRIPLETEX_VOUCHER_ALLOW_BANK_LINES=1`** skips the check (sandbox only).\n"
+            "**Dimensions:** use **`freeAccountingDimension1: {id: VALUE_ID}`** on the **debit** line (or **`accountingDimensionValues`** — runtime maps to **`freeAccountingDimension1`**). **Never** same **`account.id`** on both sides (see SYSTEM_PROMPT **CRITICAL — custom dimension**).\n"
             "On **422** for a sub-resource line, **retries once** with **negated** **`amountGross`**.\n"
             "**`send_to_ledger`: true** → after a successful create, **`PUT /ledger/voucher/{id}/:sendToLedger`** — **never** **`?sendToLedger=true`** on an **empty** shell.\n"
-            "Optional **`shell_extras`** merges extra **Voucher** fields (not **postings**). "
+            "Optional **`shell_extras`**: extra **Voucher** fields (not **postings**). Use **`shell_extras.customer`** or top-level **`customer`** so **debit** lines get **`customer: {id}`** when the tenant requires it (e.g. **1500** reminder fees). "
             "Returns **`voucher`**, **`voucherId`**, **`posting_mode`**, **`postingResponses`**, **`sendToLedgerResponse`** (or error keys)."
         ),
         "input_schema": {
@@ -962,7 +1457,15 @@ TOOLS = [
                 },
                 "shell_extras": {
                     "type": "object",
-                    "description": "Optional extra Voucher fields (e.g. voucherType)— never line data",
+                    "description": "Optional extra Voucher fields (e.g. voucherType). May include customer: {id} for AR debit lines.",
+                },
+                "customer": {
+                    "type": "object",
+                    "description": "Optional {id: N} — copied onto posting lines with amountGross > 0 missing customer (kundefordring / reminder fees).",
+                },
+                "supplier": {
+                    "type": "object",
+                    "description": "Optional {id: N} — same party as customer in Tripletex; merged like **customer** when **customer** is omitted (supplier-invoice voucher fallback).",
                 },
             },
             "required": ["date", "postings"],
@@ -998,7 +1501,7 @@ TOOLS = [
             "{invoiceDate: 'YYYY-MM-DD', invoiceDueDate: 'YYYY-MM-DD'} or in **body** if Swagger expects JSON — never call :invoice with no dates.\n"
             "**Customer — register payment:** **PUT** `/invoice/{id}/:payment` — **required query params**: paymentDate, paymentTypeId, **paidAmount**; "
             "**`GET /invoice/{id}`** first — use **`amountOutstanding`** / **`amountCurrencyOutstanding`** for **full** pay (**FCY** → **`amountCurrencyOutstanding`** as NOK equivalent per Tripletex — **do not** **FCY × payment rate**). Optional **paidAmountCurrency**. **One PUT per bank transaction**. Omit body unless Swagger requires JSON. "
-            "**Runtime:** **`execute_tool`** may **WARNING** if **paidAmount** is much larger than live **amountOutstanding** (suspect **FCY × rate**).\n"
+            "**Runtime:** **`execute_tool`** **warns**, **clamps**, or **blocks** **paidAmount** when it is far above live **amountOutstanding** (FCY × rate mistake) — env **`TRIPLETEX_PAYMENT_PAIDAMOUNT_ACTION`** = warn | clamp | block (default **clamp**).\n"
             "**Supplier — register payment:** **POST** `/supplierInvoice/{invoiceId}/:addPayment` — use **tripletex_post** with **body** **`{}`** and **params** (paymentType, amount, paymentDate, partialPayment, …) — **not** this tool (PUT-only).\n"
             "**Reverse a payment** (bank return / undo payment): after **`GET /invoice/{id}`** (see **`postings`**), **`PUT /ledger/voucher/{paymentVoucherId}/:reverse`** with **params** **`{date: 'YYYY-MM-DD'}`** — **not** `:createCreditNote` (that credits the **sale**).\n"
             "**Send invoice:** **`PUT /invoice/{id}/:send`** — **required** query **`sendType`**: **EMAIL**, **EHF**, **MANUAL**, **PAPER**, etc. (OpenAPI enum). Optional **`overrideEmailAddress`** when **`sendType`** is **EMAIL** and the task gives an address. Use **invoice `id`** from **`PUT /order/.../:invoice`** response **`value.id`**.\n"
@@ -1076,6 +1579,7 @@ If **PUT /ledger/account/{id}** returns **422** (e.g. **`version`** required), *
 If you are **not** about to **`:invoice`**, **skip** this entire 1920 block (see **WHEN TO SKIP** above).
 
 LANGUAGES: Tasks arrive in Norwegian, Nynorsk, English, German, French, Spanish, or Portuguese. Understand fully before acting. **Invoice «send» cues:** e.g. **send** / **e-post** / **email** (EN/NO), **enviar** / **envie** / **mandar** (PT/ES), **envoyer** (FR), **senden** / **versenden** (DE) — if present, you must **`PUT /invoice/{id}/:send`** after **`:invoice`** (see **Create invoice**).
+**German (DE) — ledger / cost analysis:** **Hauptbuch**, **Aufwandskonten**, **Kosten**, **Januar**/**Februar** comparisons → **`GET /ledger/voucher`** + voucher **postings**; sum **debit** on expense accounts (classes **5–8**). **Do not** **`POST /project`** / **`POST /customer`** when the task is **only** analysis or ranking accounts — create entities **only** if wording **explicitly** requires **Projekt**/**Kunde**/registration.
 
 SCORING — THIS MATTERS:
 - You are scored on CORRECTNESS (field-by-field checks) and EFFICIENCY (API call count + zero 4xx errors)
@@ -1095,12 +1599,13 @@ PLANNING RULE: Before any API call, think through:
 4. What is the minimum sequence of calls to complete this correctly?
 
 TRIPLETEX API KNOWLEDGE:
-- Paths: /employee, /employee/employment (employment **`id`**; **GET** **`?employeeId=`** list; **PUT** with **`division: {id}`**), /customer, /product, /activity, /order, /invoice, **/supplierInvoice** (leverandørfaktura — list requires **`invoiceDateFrom`** / **`invoiceDateTo`** like **`/invoice`**), **/invoice/{id}/:send** (e-mail / EHF / manual send — **tripletex_put_action** with **`sendType`** query), /invoice/paymentType (**`fields=id`** only), /project, /project/hourlyRates, /timesheet/entry, /project/orderline ([BETA] project lines), /department, /travelExpense, /travelExpense/costCategory (+ **`/{id}`** for details), /travelExpense/paymentType (**`fields=id`** only), /travelExpense/perDiemCompensation, /travelExpense/cost, /salary/transaction, /salary/type, /salary/payslip (read-only), /salary/compilation (read-only), /ledger/account, **manual journals: `tripletex_post_voucher` tool** (wraps **`/ledger/voucher`** + **`/ledger/voucher/{id}/postings`**), /ledger/accountingDimensionName, /ledger/accountingDimensionValue (custom dimensions), /ledger/vatType (VAT ids for products) — **avoid** **`GET /company/divisions`** for payroll setup (often **403** in competition)
+- Paths: /employee, /employee/employment (employment **`id`**; **GET** **`?employeeId=`** list; **PUT** with **`division: {id}`**), **/employee/employment/details** (**POST** — **`percentageOfFullTimeEquivalent`**, **`annualSalary`**, **`monthlySalary`** tied to **employment** **`id`**), /customer, /product, /activity, /order, /invoice, **/supplierInvoice** (leverandørfaktura — list requires **`invoiceDateFrom`** / **`invoiceDateTo`** like **`/invoice`**), **/invoice/{id}/:send** (e-mail / EHF / manual send — **tripletex_put_action** with **`sendType`** query), /invoice/paymentType (**`fields=id`** only), /project, /project/hourlyRates, /timesheet/entry, /project/orderline ([BETA] project lines), /department, /travelExpense, /travelExpense/costCategory (+ **`/{id}`** for details), /travelExpense/paymentType (**`fields=id`** only), /travelExpense/perDiemCompensation, /travelExpense/cost, /salary/transaction, /salary/type (**`GET`** **`fields=id,name`** only — **no** **`displayName`**; sanitized in **`TripletexAPI.get`**), /salary/payslip (read-only), /salary/compilation (read-only), /ledger/account, **manual journals: `tripletex_post_voucher` tool** (wraps **`/ledger/voucher`** + **`/ledger/voucher/{id}/postings`**), /ledger/accountingDimensionName, /ledger/accountingDimensionValue (custom dimensions), /ledger/vatType (VAT ids for products) — **avoid** **`GET /company/divisions`** for payroll setup (often **403** in competition)
 - Action URLs use a /:actionName segment (e.g. /:invoice, **/invoice/{id}/:send**, /:createCreditNote, **/ledger/voucher/{id}/:reverse**) — call these with tripletex_put_action (PUT), not as a normal field update on tripletex_put
 - Dates: "YYYY-MM-DD" format always
 - List responses: {"fullResultSize": N, "values": [...]}
 - GET /invoice (listing or searching invoices): **required query params** **invoiceDateFrom** and **invoiceDateTo** (YYYY-MM-DD). **This is mandatory even if you add other filters** (customerId, fields, from, count, etc.) — Tripletex still returns **422** (“Kan ikke være null”) if either date is missing. Use a wide window when needed (e.g. 2000-01-01 through 2099-12-31). Only **GET /invoice/{numericId}** for one invoice skips this rule
-- Invoice list **fields** (confirmed): **id**, **invoiceNumber**, **invoiceDate**, **amountExcludingVat** — do **not** request **isPaid**, **dueDate**, **amountIncludingVat**, or **paid** (not on InvoiceDTO for this list)
+- Invoice **fields** (list **and** **GET /invoice/{id}**): **id**, **invoiceNumber**, **invoiceDate**, **amountExcludingVat**, **invoiceDueDate**, **customer**, **amountOutstanding**, **amountCurrencyOutstanding** — use **`invoiceDueDate`** for forfall — **not** **`dueDate`**. Do **not** request **isPaid**, **amountIncludingVat**, or **paid** (illegal **`fields`** filter on **InvoiceDTO**; agent strips/maps them).
+- **Purring / rappel / reminder fee** booked as **`tripletex_post_voucher`** (debit **kundefordringer 15xx**, credit **inntekt**): set tool **`customer: {id}`** (same as the invoice customer) or put **`customer`** on each **debit** line — otherwise **422** *«Kunde mangler»*. **Credit account:** **`GET /ledger/account?number=NNNN&fields=id,number,name`** — if the task says **3400** but **`name`** is **tilskudd** / **offentlig** (not **gebyr**/**fee**-like), pick another **inntektskonto** the task names or try **8040**/**8050** (confirm with **`GET`** **`name`**). **Do not** switch to **ordre/faktura** or **`:payment`** unless the task explicitly asks — **`:payment`** on the **overdue** invoice needs **`paidAmount`** from **`GET /invoice/{id}`** **`amountOutstanding`** for **full** settlement unless the prompt gives a **specific** partial. **After** the **reminder voucher** succeeds, **do not** invent **`:payment`** on the **original** invoice with a **made-up** amount — **if** the task also asks for a **customer invoice** for the fee, then **product** + **order** + **`:invoice`** + **`:send`** is correct.
 - **Products:** before **`POST /product`**, **`GET /product`** with **`name`** (and **`productNumber`** if the task has a SKU) + **`fields=id,name,number`** — reuse **`id`** when the row matches; on **422** duplicate name/number messages, **GET** and reuse — do not spam **`POST /product`**
 - POST /order: **deliveryDate** is **required** (422 if null). If the prompt does not give a delivery date, use the same **YYYY-MM-DD** as **orderDate**
 - **Order lines + VAT (invoices):** **`orderLines[]`** supports **`vatType: {id}`** (same **outgoing** sales codes as products). If the task gives **different VAT % per line**, set **`vatType` on every line** from the task — **do not** assume the **product** master **vatType** matches each line. **Standard Norwegian outgoing** **id** shortcut (competition — **skip GET /ledger/vatType** unless the rate is unusual or **POST /order** **422**): **25% → 3**, **15% → 31**, **12% → 32**, **0% → 6**. **Efficiency:** after **PUT /order/{id}/:invoice** returns **success**, **do not** **GET /invoice/{id}** only to re-read line VAT unless the prompt explicitly asks for verification or payment amounts you cannot compute.
@@ -1116,10 +1621,13 @@ Invoice bank registration: use **MANDATORY SETUP BEFORE INVOICE TASKS** at the *
 Create department:
 POST /department {name: "..."}
 CRITICAL: Several departments → **one POST /department per department** (separate bodies), not one call with an array.
+**Before POST:** **`GET /department?fields=id,name`**. If **`values[]`** already has a row whose **name** matches the PDF/prompt (trim, case-insensitive, allow minor punctuation differences), **reuse** **`id`** — **do not** create a near-duplicate department.
+
+**PDF / scanned offer letters (*lettre d'offre*, *tilbudsbrev*, *contrato de trabajo*, employment contract):** The hire's **email**, **department**, **start date**, **national ID / DNI / fødselsdato**, **occupation code** (*código de ocupación*), and **salary** often appear **only in the attached PDF** — **read the document first**, then call APIs. **Never** **`GET /employee?email=`** with an **empty** string (runtime **blocks** it). Use the **exact** email string from the PDF for **Step 0**.
 
 Create employee:
-Step 0 — **Before any POST /employee** for a named person: **tripletex_get** **`GET /employee?email=<their email>&fields=id,firstName,lastName`**. If **`values`** contains a match, **reuse** **`id`** (project manager, timesheet, employment, etc.) — **never** **POST /employee** for that email (**422** *«Det finnes allerede en bruker med denne e-postadressen»* / duplicate user). Repeat Step **0** for **each** distinct email the task names before creating anyone new.
-Step 1 — GET /department?fields=id,name to find department id (needed when you will **POST** a **new** employee in Step **2**)
+Step 0 — **Before any POST /employee** for a named person: **tripletex_get** **`GET /employee?email=<their email>&fields=id,firstName,lastName`** — **`email`** must be non-empty (from prompt/PDF). If **`values`** contains a match, **reuse** **`id`** (project manager, timesheet, employment, etc.) — **never** **POST /employee** for that email (**422** *«Det finnes allerede en bruker med denne e-postadressen»* / duplicate user). Repeat Step **0** for **each** distinct email the task names before creating anyone new.
+Step 1 — **`GET /department?fields=id,name`**. Choose **`department.id`** from the row that matches the PDF/prompt; **only** if **no** row matches, **`POST /department`** once with the required name (see **Create department**).
 Step 2 — **Only if Step 0 returned no row** for that person: POST /employee {
   firstName,
   lastName,
@@ -1131,22 +1639,25 @@ Step 2 — **Only if Step 0 returned no row** for that person: POST /employee {
 Step 3 — **POST /employee/employment** when the task needs employment (incl. **startDate** in prompt) **or any payroll / lønn / salary work** (if prompt omits date, use **`"2026-01-01"`** or task-aligned date):
 **Before** this POST for the employee (**id** from **Step 0** or **Step 2**): **tripletex_get** **`GET /employee/{id}?fields=id,dateOfBirth`**. If **`dateOfBirth`** is **null**, **tripletex_put** **`PUT /employee/{id}`** with **`{"dateOfBirth": "YYYY-MM-DD"}`** — use the **prompt** birth date if stated; if the task gives **no** birth date, use **`1990-01-01`** **once** (API valid date placeholder for tenants that require DOB before employment). **Skipping this** often causes **422** *«employee.dateOfBirth»* / *«Feltet må fylles ut»* on **POST /employee/employment**.
 
-**POST /employee/employment — start minimal (required pattern):** On some tenants, including **division**, **isMainEmployer**, or **taxDeductionCode** on **POST** returns **404**. **Always** try **first** with **only**:
-```json
-{"employee": {"id": EMPLOYEE_ID_FROM_STEP_0_OR_2}, "startDate": "YYYY-MM-DD"}
-```
-**After** a **200** minimal create: **GET** **`/employee/employment?employeeId=…`** for **`employmentId`**, then **`PUT /employee/employment/{employmentId}`** with **`isMainEmployer`**, **`taxDeductionCode`**, **`division`**, etc. **only** when Swagger/your tenant accepts those fields on **PUT** (some fields may be **POST-only** on other tenants — use **GET**+**inspect** if **PUT** **422**s).
+**POST /employee/employment — body from the model:** Send **`{employee: {id}, startDate: "YYYY-MM-DD"}`** (plus any extra fields Swagger allows). **Semantics:** **`department`** on **`POST /employee`** = organisasjons**avdeling**; **`division`** on **employment** = **virksomhet** for **lønn** (**`POST /salary/transaction`** requires employment linked to a **division**).
 
-If **404** on a **non-minimal** **POST** body, **`execute_tool`** **retries once** with **`{employee, startDate}`** only; if **404** persists, treat as tenant/data issue.
+**Runtime (`execute_tool`):** If the body is **exactly** **`employee` + `startDate`**, the tool **POST**s with **`division: {id: 1}`**, then **`2`**, then **`3`** — each step only after **HTTP 404** on the previous — then **minimal** without **`division`**. **Non-minimal** **POST** **404** → strip to **`{employee, startDate}`** once. Goal: avoid **422** *«Virksomheten kan ikke endres»* on **PUT** **division** when a tenant accepts **`division`** only on **create** for a specific id.
 
-Note the returned employment **`id`** (or **GET** **`/employee/employment?employeeId=newEmployeeId&fields=id,startDate,division`** to read the row).
+**After** **200**: **GET** **`/employee/employment?employeeId=…&fields=id,startDate,division`**. If **`division`** is **already** set (create-time shortcut worked), **skip** **Step 4** **PUT** **division**. Else **`PUT /employee/employment/{id}`** for **`isMainEmployer`**, **`taxDeductionCode`**, etc. when accepted.
 
-Step 4 — **Link employment → division (virksomhet)** — often needed for **`POST /salary/transaction`**; error *«Arbeidsforholdet er ikke knyttet mot en virksomhet»* means **`division`** was never set:
+Step 4 — **Link employment → division (virksomhet)** — only if **`GET`** still shows **`division: null`**; error *«Arbeidsforholdet er ikke knyttet mot en virksomhet»* on salary means **`division`** was never set:
 - **Do not** rely on **`GET /company/divisions`** — it often returns **403** in competition; **do not** stall the run on it.
 - **tripletex_get** **`GET /employee/employment/{employmentId}?fields=id,division`**.
-- If **`division`** is **null** / missing: **tripletex_put** **`PUT /employee/employment/{employmentId}`** body **`{"division": {"id: 1}}`**. **Log** success or error. On **403**, retry **`{"division": {"id": 2}}`**, then **`{"division": {"id": 3}}`**, logging each attempt.
+- If **`division`** is **null** / missing: **tripletex_put** **`PUT /employee/employment/{employmentId}`** with JSON **`{"division": {"id": 1}}`**. On **403**, retry **`{"division": {"id": 2}}`**, then **`{"division": {"id": 3}}`**, logging each attempt.
 - **422** *«Virksomheten kan ikke endres»* on **any** **`PUT`** with **`division`**: **stop immediately** — **never** send **`PUT`** with **`division` 2** or **3** (or any other id) for **this** **`employmentId`** in the same run. The runtime may **block** further division **PUT**s after the first such **422**. **Continue** with **`POST /salary/transaction`** (tenant may still accept payroll); if **that** fails on **virksomhet**, it is likely **sandbox/company setup**, not missing retries.
 - **COMPETITION SHORTCUT:** **`division.id: 1`** often works when **PUT** is allowed — try **`1`** first once; after a **200**/**204**, **reuse** that **`id`** for other employments where **PUT** is allowed.
+
+Step 3b — **Stillingsprosent / årslønn** (**`POST /employee/employment/details`**): When the task gives **stillingsprosent** (e.g. 80%) and/or **årslønn** / **månedslønn**, register them **before** **`POST /salary/transaction`**:
+- **`employment`**: **`{id}`** = **`/employee/employment`** row **`id`** (**not** the employee **`id`**) from **`GET /employee/employment?employeeId=…`**
+- **`date`**: **`startDate`** or first day of the salary month **`YYYY-MM-DD`**
+- **`percentageOfFullTimeEquivalent`**: e.g. **80.0** for 80% stilling
+- **`annualSalary`** and/or **`monthlySalary`**: per PDF/prompt (whole kroner unless **422** says otherwise)
+- **Never** **`PUT /employee/employment/{id}`** with **`percentageOfFullTimeEquivalent`** — Tripletex returns *«Feltet eksisterer ikke i objektet»*; that field lives on **EmploymentDetails** (**`POST /employee/employment/details`** per OpenAPI).
 
 CRITICAL: Do NOT put employmentDetails inside POST /employee body — field does not exist.
 CRITICAL: **Step 2** **POST /employee** requires **userType** and **department.id** — POST will fail without them. **Skip Step 2** when Step **0** already returned an **`id`** for that email.
@@ -1162,7 +1673,7 @@ POST /customer {
 **Flags — set explicitly (Tripletex defaults `isCustomer` to true if omitted; graders often expect pure suppliers with `isCustomer: false`):**
 - **Customer only** (kunde, customer, client, …): **`isCustomer: true`**, **`isSupplier: false`** unless the prompt also makes them a supplier.
 - **Supplier only** (leverandør, supplier, proveedor, fournisseur, Lieferant, …): **`isSupplier: true`**, **`isCustomer: false`** — **always** send **`isCustomer: false`** on **POST**.
-- **Supplier-only — tenant quirk:** Many tenants **return** **`isCustomer: true`** in the **`POST /customer`** response **even when** you sent **`isCustomer: false`**. **Do not** trust **`POST`** alone — **persisted** state must be read via **GET**. After **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**: **(1)** **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** — **(2)** if **`isCustomer`** is still **`true`**, **`tripletex_put` `PUT /customer/{id}`** body **`{"isCustomer": false}`** — **(3)** **verify** with another **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** if the grader requires a clean check. Then continue (e.g. **`POST /supplierInvoice`**). **Do not** skip this when the task is **leverandør-only**.
+- **Supplier-only — tenant quirk:** Many tenants **return** **`isCustomer: true`** in the **`POST /customer`** response **even when** you sent **`isCustomer: false`**. **Do not** trust **`POST`** alone — **persisted** state must be read via **GET**. After **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**: **(1)** **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** — **(2)** if **`isCustomer`** is still **`true`**, **`tripletex_put` `PUT /customer/{id}`** body **`{"isCustomer": false, "isSupplier": true}`** (both flags — some tenants ignore a lone **`isCustomer: false`**) — **(3)** **`GET`** again; if still **`isCustomer: true`**, **one more** **`PUT`** with the **same** two-field body, then continue — **do not** burn **>3** PUT round-trips. Then continue (e.g. **`POST /supplierInvoice`** or voucher fallback). **Do not** skip this when the task is **leverandør-only**.
 - **Both** roles only when the prompt **explicitly** says the entity is a customer **and** a supplier: **`isCustomer: true`**, **`isSupplier: true`**.
 CRITICAL: Never omit email or organizationNumber if they appear in the prompt.
 
@@ -1171,7 +1682,8 @@ When the task is to **record** / **register** / **book** a **received supplier i
 
 1. **Supplier:** **`GET /customer?organizationNumber=X&fields=id,name,organizationNumber,isSupplier,isCustomer`** (and **`email`** if needed). If **no row**, **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**, **`name`**, **`organizationNumber`**, **`email`** when stated. **`supplier_id`** = matching **`values[].id`** from **GET**, or **`value.id`** from **`POST`**. For **supplier-only** tasks: **after** **`POST /customer`**, or whenever **`values[]`** / **`value`** shows **`isCustomer: true`**, follow **Supplier-only — tenant quirk**: **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** (always include **`isCustomer`** in **`fields`** to verify persisted state **before** **`PUT`**) → **`PUT`** if needed → optional **second `GET`** to verify.
 2. **Cost / expense account:** **one** **`GET /ledger/account?number=NNNN&fields=id,number,name`** for the **stated** GL (**7300**, etc.) — **do not** scan many account numbers «just in case»; use for **follow-up** (voucher / line edits) only after **`POST /supplierInvoice`** succeeds **or** if the API documents a **required** field you still lack.
-3. **Create invoice — `POST /supplierInvoice`:** Bare **`invoiceNumber`** + **`invoiceDate`** + **`supplier`** uten beløp ga **HTTP 500** (code **1000**) i live-test — sannsynlig **manglende påkrevd felt**. **Standard body** (beløp **inkl. MVA** som oppgaven oppgir som TTC / inkl. MVA / «inklusive»):
+3. **Create invoice — `POST /supplierInvoice`:** Published OpenAPI often omits **POST** on **`/supplierInvoice`**, but the endpoint exists. **Standard body** (beløp **inkl. MVA** / TTC):
+   - **Probe result (NM competition sandbox, 2026-03):** Bodies with **`invoiceNumber`**, **`invoiceDate`**, **`supplier`**, **`amountCurrency`**, **`currency`**, with or without **`invoiceDueDate`**, **`orderLines`** (no **`account`** on lines), or **`amount`** instead of **`amountCurrency`**, consistently return **HTTP 500** **`code` 1000** with **empty** **`message`** / **`validationMessages`** — likely **tenant/module**, not a missing JSON field you can fix client-side. **`vatExemptAmount`**, **`vendorInvoiceNumber`**, **`department`** on create → **422** *Feltet eksisterer ikke*. **HTTP 500 + `code` 1000** — **do not** call **`tripletex_post` `/supplierInvoice` again** for the **same** **`invoiceNumber` + `supplier.id`**. **Immediately** use **`tripletex_post_voucher`**: **cost** + **inngående MVA** (**`vatType: {id: 1}`** on expense line **or** separate **2710** line per chart) + **leverandørgjeld** (**2400** or the chart’s AP account) with **`supplier: {id}`** on the **credit** line. **422** *«Kunde mangler»*: **supplier** and **customer** share the same **party** **`id`**; **`execute_tool`** copies **`supplier`**’s **`id`** onto **positive debit** lines as **`customer`** when debits lack it (or pass tool **`customer`** / **`supplier`** at root).
 ```json
 {"invoiceNumber": "INV-...", "invoiceDate": "YYYY-MM-DD", "supplier": {"id": supplier_id}, "amountCurrency": AMOUNT_INCL_VAT, "currency": {"id": 1}}
 ```
@@ -1284,6 +1796,7 @@ POST /project {
   projectManager: {id: X},  # find via GET /employee?email=X
   startDate: "YYYY-MM-DD",  # REQUIRED — use today's date if not specified in prompt
 }
+**Portuguese cues:** **Crie o projeto** / **projeto** + **cliente** + **org. nº** / **nº** → **GET /customer?organizationNumber=…** then **GET /employee?email=…** for **gerente de projeto** / **project manager** → **POST /project** as above (**no** extra steps unless prompt asks).
 CRITICAL: startDate is required — always include it, use today (2026-03-19) if not given.
 Optional endDate if the task specifies an end.
 CRITICAL (efficiency): **Fixed price / Festpreis** on an existing or new project → **`PUT /project/{id}`** with **`isFixedPrice: true`** and **`fixedprice`** (NOK) after **`POST /project`** if needed. **No** **1920** bank setup unless the same task also requires **`:invoice`**.
@@ -1295,6 +1808,7 @@ When the task describes a **full project lifecycle**, **complete project**, **re
 1. **POST /project** with **`customer`**, **`projectManager`**, **`startDate`** (and **`GET /employee?email=`** / **Create employee** steps as needed). If the task states a **budget** / **fixed price** / **Festpreis**, **`PUT /project/{id}`** with **`isFixedPrice: true`** and **`fixedprice`**.
 2. **GET /activity** — pick **`activity.id`** matching the task (billable / named activity; use **`/activity/>forTimeSheet`** or **`/project/>forTimeSheet`** filters per Swagger if list search is ambiguous).
 3. **POST /timesheet/entry** — **separate POST for each** employee / date / hours combination the prompt specifies (**project**, **activity**, **employee**, **date**, **hours**).
+   - **CRITICAL — `hours` sanity:** For **one calendar `date`**, **`hours` must be ≤ 24** (realistic day work **≤ ~12**). **French / EU decimal comma:** **5,5 h** in the task means **JSON `5.5`**, **not** **`55`** or **`57`**. If amounts look like **weekly** totals, **split by day** per the prompt or use **daily** hours stated — **never** post **57** or **99** for a **single** **`date`** unless the task **explicitly** says so (e.g. aggregate across **multiple** entries).
 4. If the task requests **invoice** / **faktura** / **fakturere** / **:invoice**: follow **Create invoice** or **Invoice from a project** (**1920** only when **`:invoice`** applies — see **WHEN TO SKIP**): **`POST /order`** (often with **`project: {id}`**) → **`PUT /order/{id}/:invoice`** → **`PUT /invoice/{id}/:send`** if send wording appears.
 
 **Do not `end_turn` until ALL steps the user mentioned in this category are completed** (project + fixed price if budget + every stated timesheet row + order/invoice/send if requested). Partial runs fail checks and efficiency.
@@ -1302,7 +1816,7 @@ When the task describes a **full project lifecycle**, **complete project**, **re
 Log hours (timesheet entry):
 **Employee id:** from **Create employee Step 0** (**`GET /employee?email=X&fields=id,firstName,lastName`**) when the person already exists — **do not** **POST /employee** and hit duplicate-email **422**. If Step **0** is empty, create via Step **2** first.
 GET /project?name=X&fields=id,name → project id
-GET /activity?name=X&fields=id,name → activity id
+GET /activity?name=X&fields=id,name → activity id (**`fields`:** **no** **isInactive** — invalid **ActivityDTO** filter → **400**; **id**, **name**, **activityNumber** OK per Swagger)
 POST /timesheet/entry {
   project: {id},
   activity: {id},
@@ -1329,24 +1843,21 @@ Confirmed field names (live testing) — **do not** guess **`name`** / **`value`
 - **Step 1 —** **POST** `/ledger/accountingDimensionName` with body **`{"dimensionName": "X"}`** (NOT **`name`** or **`displayName`**) → response gives the **dimension** **id** (for reference; values are **not** linked via this id in the value POST body).
 - **Step 2 —** **POST** `/ledger/accountingDimensionValue` with **`{"displayName": "Value1"}`** (NOT **`value`** or **`name`**) → note **value** **id₁**.
 - **Step 3 —** **POST** `/ledger/accountingDimensionValue` with **`{"displayName": "Value2"}`** → note **value** **id₂** (repeat for more values).
-- **Step 4 —** Create the journal with **`tripletex_post_voucher`** (see below). On each line that needs a dimension, set **`accountingDimensionValues: [{"id": VALUE_ID}]`** (**VALUE_ID** = id from steps 2/3).
+- **Step 4 —** Create the journal with **`tripletex_post_voucher`** (see below). On each line that needs a dimension, set **`freeAccountingDimension1: {"id": VALUE_ID}`** (**VALUE_ID** = **`id`** from **POST** **`/ledger/accountingDimensionValue`** in steps 2/3). You may also write **`accountingDimensionValues: [{"id": VALUE_ID}]`** in the tool — **`execute_tool`** maps it to **`freeAccountingDimension1`** (Tripletex **Posting** rejects **`accountingDimensionValues`** on **POST /ledger/voucher** — *feltet eksisterer ikke*).
 
-**NOTE:** On **posting** objects use **`accountingDimensionValues`** — **not** **`freeAccountingDimension1`** (wrong for **`/postings`** sub-resource in live testing).
+**CRITICAL — custom dimension + manual journal (competition **Task ~06** pattern):**
+- **Two different GL `account.id` values** — **never** debit and credit the **same** account (e.g. **7000** **`amountGross` +30250** and **7000** **−30250**). That is not a valid expense entry; Tripletex often **422**s one-step voucher create and you waste turns. **`GET /ledger/account?number=NNNN&fields=id,number,name`** for the **debit** GL the task names (**7000**, **6xxx**, …) **and** for a **real** **credit** target: **2900**-class (*forskudd/gjeld*), **2400** (*leverandørgjeld* + **`supplier`** if required), **1500** (*kundefordringer* + **`customer`** if required), **2740** (*MVA*), or another **non-bank** account the prompt states.
+- **Dimension on the correct line:** put **`freeAccountingDimension1: {"id": VALUE_ID}`** (or tool-only **`accountingDimensionValues`**) on the **posting** the task links to the cost centre (usually the **debit** **expense** line). Leave the **credit** line without dimension unless the task explicitly requires it on both.
+- **Balance:** sum **`amountGross` = 0**; **debit +** / **credit −**; **`send_to_ledger: true`** when the task expects the voucher posted.
+
+**NOTE:** For **voucher** **POST** bodies, Tripletex expects **`freeAccountingDimension1..3`** — **`accountingDimensionValues`** is **rejected** on inline create; the agent rewrites **`accountingDimensionValues` → `freeAccountingDimension*`** automatically.
 
 Other lookups ( explore Swagger + **GET** **`fields`** before **POST** ):
 - **GET/POST** `/ledger/accountingDimensionName`, `/ledger/accountingDimensionValue` (and list/search variants)
 - **GET** `/ledger/account`, **GET** `/department` — accounts and departments for postings
 - **GET** `/project/orderline` [BETA] — if the task ties amounts to project lines
 
-**Month-end / accruals (e.g. French *clôture mensuelle*, *régularisation*, *vers charges*, Norwegian *periodisering*):**
-- **Prepaid / forskudd** accounts (**1710–1770**, **1720** *Andre depositum*, etc.) → **cost recognition**: typically **debit** the **expense** account that matches the **economic substance** in the prompt (rent, insurance, lease, etc.) — **credit** the **prepayment** balance-sheet account. **Do not** default to **5000** *«Lønn til ansatte»* unless the task explicitly links the amount to **salary** / **lønn** / *salaires*.
-- **Only post what the prompt lists** — do **not** add extra journals (e.g. salary accrual, provisions) unless the task text requires them.
-- **Depreciation (*amortissement* / *avskrivning* / årsoppgjør):** Use **`GET /ledger/account?number=…`** for **debit** (expense) and **credit** (asset / accumulated dep) **ids**. **Chart hints (Norwegian NS-style — confirm account names on the tenant):**
-  - **Programvare / software / intangible assets** → depreciation expense **6020** — **not** **6010**.
-  - **IT-utstyr / computer hardware** → **6020** or **6540** (or tenant equivalent).
-  - **Kjøretøy / transport assets** → **6010** (*Avskriving på transportmidler*).
-  - **Maskiner / machinery** → **6010** or **6000** (or tenant equivalent).
-  - **Never** use **6010** for **software** / **immaterial** depreciation — **6010** is for **transport** assets in standard charts.
+**Month-end / accruals (*periodisering*, *avskrivning*, *clôture*, year-end tax):** **Prepaid / forskudd** → **Dr** expense matching substance (**6xxx** *leie/lokale* from **`GET` by number**), **Cr** the prepayment account the task names — **not** **7140**/travel or **5000**/lønn unless the task says so. **Depreciation:** **`GET` each stated asset GL** (**1250**, **1210**, …) for **credit** (−**amountGross**); **Dr** **6020**/software, **6010**/vehicles, or task-named expense — **do not** default **1290** for every asset. **Tax accrual:** **Dr** *skattekostnad* (**8300** or **`GET` by name**), **Cr** tax-payable **gjeld** (**2500**/**2540**/**2900**-class) — **not** **8990**/**2920** unless named.
 
 Book expense from receipt (kvittering / **bilag fra PDF**) — **Task 22 pattern** (**togbillett**, **train ticket**, **receipt PDF**, **bokfør utgift**, **kvittering**, **department** + **MVA**):
 When the task is to **book** a **purchase** from an **attached PDF receipt** on the **general ledger** (manual journal — **not** the full **POST /travelExpense** + **POST /travelExpense/cost** flow unless the prompt explicitly asks for a **travel report**), follow this path:
@@ -1365,7 +1876,7 @@ When the task is to **book** a **purchase** from an **attached PDF receipt** on 
 
 **Do not** `end_turn` after only **GET**s — **`tripletex_post_voucher`** must run when the user asked to **bokfør** from the receipt.
 
-Create ledger voucher (bilagsføring) — **always** call **`tripletex_post_voucher`** (**never** **`tripletex_post`** on **`/ledger/voucher`** — the tool is blocked). Swagger [v2-docs](https://tripletex.no/v2-docs/) documents **`postings`** (plural); the implementation **also retries** with top-level **`posting`** (singular) if inline **`postings`** returns *uten posteringer* **422**. Do **not** hand-craft **`rows`**. The helper **tries one-step first** (fewer calls, avoids tenants that reject an **empty** **`postings`** shell with *«Et bilag kan ikke registreres uten posteringer»*):
+Create ledger voucher (bilagsføring) — **always** call **`tripletex_post_voucher`** (**never** **`tripletex_post`** on **`/ledger/voucher`** — the tool is blocked). Swagger [v2-docs](https://tripletex.no/v2-docs/) documents **`postings`** (plural). **422** responses are logged in **full** before retries — they are often **`VALIDATION_ERROR`**: *«Kunde mangler»* (**`postings.customer.id`**), *«Summen av posteringene … er ikke lik 0»*, or *uten posteringer*; fix the **posting** data (balance, **`customer`** on debits when AP has **`supplier`**, distinct GL accounts), not only the HTTP shape. The tool retries **no `sendToLedger` query**, singular **`posting`**, **hybrid** first-line inline + **`/postings`**, then **empty** shell + per-line **`/postings`**. Do **not** hand-craft **`rows`**. **One-step first** when inline postings are accepted.
 
 **CRITICAL:** Never use **bank accounts** (**`isBankAccount: true`**, accounts like **1920**, **1910**, etc.) as posting lines in **`tripletex_post_voucher`**. Tripletex **rejects** manual postings to **reconciliation** accounts. For **cash/bank** movements use **payment actions** (`/:payment`, `/:addPayment`) instead.
 
@@ -1378,6 +1889,8 @@ Create ledger voucher (bilagsføring) — **always** call **`tripletex_post_vouc
 
 CRITICAL: **amountGross** — **positive = debit**, **negative = credit**; **NOT** debit, credit, debitAmount, creditAmount (alternate: **`amount`** per OpenAPI).
 CRITICAL: All lines must **balance** (sum of **amountGross** = 0).
+CRITICAL: **Company-currency lines** — **`amountGrossCurrency`** and **`amountCurrency`** must match **`amountGross`** / **`amount`** when the tenant validates FCY fields (the tool sets these automatically when **`amountGross`** is present).
+If **422** mentions **Leverandør** / **`postings.supplier`**, put **`supplier: {id}`** on the affected line(s) or use **`POST /supplierInvoice`** for vendor invoices — some **kontoer** require a supplier reference.
 **Document import** (only when the task is a **file**): **POST /ledger/voucher/importDocument** — **multipart/form-data** **`file`** — **not** **`tripletex_post_voucher`**.
 
 If **POST /ledger/voucher/{id}/postings** returns **404**, re-check the tenant **openapi.json** — some snapshots omit that sub-resource.
@@ -1386,110 +1899,23 @@ Search vouchers:
 GET /ledger/voucher?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD&fields=id,date,description,number
 CRITICAL: **dateFrom** and **dateTo** are required. **dateTo** must be **strictly after** **dateFrom**. **Voucher** list **`fields`**: **`number`** = bilagsnummer — **illegal**: **`voucherNumber`**, **`amount`** on **`VoucherDTO`** (**400**). Line amounts → **`postings`** on **`GET /ledger/voucher/{id}`** only.
 
-Ledger audit / error correction (revisjon, audit, feil i bilag, corregir errores, korrigere, libro mayor):
-When the task asks to **find** and **correct** errors in **vouchers** / **postings** / **general ledger** (not only list or describe them), you **must** finish with **booked corrections** — **never** `end_turn` after **read-only** **`tripletex_get`** alone.
-
-**Period comparison / analyse (e.g. January vs February costs):** **`GET /ledger/voucher`** **without** **`postings`** in **`fields`** first — e.g. **`fields=id,date,description,number`** — then **`GET /ledger/voucher/{id}`** only for vouchers you must inspect in detail. **Do not** list two full months with **`fields=…,postings`** in one shot — token-heavy. **`execute_tool`** **strips** any **`postings`** on **list** rows; **`postingsCount`** is **`null`** when **`postings`** were omitted (**unknown**, not zero). Deep **`GET /ledger/voucher/{id}`** is required for **account lines** and **amounts**.
-
-1. **List:** **`GET /ledger/voucher`** with **`dateFrom`**, **`dateTo`**, **`fields=id,date,description,number`** (no **`postings`** on the list — tune **`count`**; default pages are often **30** rows). If **`fullResultSize`** is **greater** than the **`values`** length, **paginate** with **`from=30`**, **`from=60`**, … until every voucher in range is loaded. Use **`GET /ledger/account?number=NNNN&fields=id,number,name`** to map **GL numbers** from the task (e.g. **6500** vs **6540**) to **`account.id`** — resolve **`account.id`** from **`GET /ledger/voucher/{id}`** **postings** when needed.
-2. **Deep read:** **`GET /ledger/voucher/{id}`** (full voucher or **`fields`** per Swagger) for each **suspect** bilag — required for **posting** lines / **amountGross** / **account.id** detail.
-3. **Analyze:** tie the prompt’s hints (*«6500 used instead of 6540»*, wrong VAT, swapped accounts, …) to **specific** **`voucher.id`** and **posting** lines and **amounts** (**`amountGross`** signs: **debit +** / **credit −**).
-4. **Correct:** for **each** error, create a **correcting voucher** with **`tripletex_post_voucher`**: typically **mirror-reverse** the wrong line(s) on the **same** wrong **account.id** (undo effect), then **post** to the **correct** **account.id** with matching amounts so **net** matches the task — **all lines in one voucher must balance** (sum **`amountGross` = 0**). Use a clear **`description`** (e.g. *Korreksjon …*). Set **`send_to_ledger: true`** when the task expects the correction in the ledger. **Do not** rely on **PUT** to edit an existing **Posting** unless OpenAPI / Swagger for the tenant explicitly exposes it (usually **prefer new correction voucher**).
-
-**Do not** stop after **GET** listing + account lookups — **always** call **`tripletex_post_voucher`** for every correction the user asked for (one or more vouchers as needed).
+Ledger audit / error correction: When the task asks to **fix** voucher/ledger errors, **finish** with **`tripletex_post_voucher`** — **never** only **`tripletex_get`**. **List** **`GET /ledger/voucher`** with **`dateFrom`/`dateTo`**, **`fields=id,date,description,number`** (no heavy **`postings`** on list — paginate). **Detail** **`GET /ledger/voucher/{id}`** for suspects (tool expands **`postings(...)`**). Map task hints to **`voucher.id`** + lines; **correct** via **mirror-reverse** wrong lines + repost right **`account.id`**; **balance** sum **`amountGross`=0**; **`send_to_ledger: true`** when expected.
 
 If a tool result shows **403** (e.g. **"Invalid or expired token"**): treat as **infrastructure** / proxy expiry — you still **continue** with every remaining call you planned (**try all departments**, all POSTs, etc.). The token may work again on the next request. **Do not** stop the whole task after the first 403. For a new submission, the platform must supply a **fresh** session_token; frequent 403s → **organisers** (Slack), not something you fix by tweaking JSON alone.
 
 Do **not** give up on the first turn for unfamiliar wording: map the task to Tripletex resources, **GET** to discover ids/shape, then **POST**/**PUT** with minimal verified calls.
 
-Travel expense (OpenAPI): trip fields are **nested** under **travelDetails** — **not** top-level on POST /travelExpense.
-
-Step 1 — POST /travelExpense {
-  employee: {id},
-  title: "...",
-  travelDetails: {
-    departureDate: "YYYY-MM-DD",
-    returnDate: "YYYY-MM-DD",
-    destination: "...",
-    purpose: "...",
-    departureFrom: "...",
-    isDayTrip: false,
-    isForeignTravel: false
-  }
-}
-CRITICAL: **departureDate**, **returnDate**, **destination**, **purpose** belong inside **travelDetails**.
-
-Per diem (Step 2) — only when the travel report is **type TRAVEL** (per diem does **not** apply to expense-report types):
-POST /travelExpense/perDiemCompensation {
-  travelExpense: {id},
-  location: "...",
-  count: N,
-  rate: 800,
-  amount: N * rate,
-  overnightAccommodation: "NONE"
-}
-
-Travel cost categories (before line costs — **session working memory**):
-- **GET /travelExpense/costCategory** (list) often returns rows with **id only** (no **name**). **GET /travelExpense/costCategory/{id}** returns **full** **TravelCostCategory** — **displayName**, **description**, **vatType** hint, etc. The **`tripletex_get` list call is auto-enriched** with per-id fetches; details are **cached in-process** for the rest of this **`/solve`** run so repeated lookups do not re-hit the network.
-- **You** should still **record** which **costCategory.id** maps to which line type (e.g. in your plan) and **reuse** those ids for every **POST /travelExpense/cost** in this task — do not pick new ids per line at random.
-- Typical **Norwegian** labels (match on **displayName** / **description**, substring / case-insensitive):
-  - Flights → **Transport** or **Fly**
-  - Taxi / ground transport → **Transport**
-  - Accommodation / hotel → **Overnatting**
-  - Per diem (**Diett**) → category **Diett** when the expense line is diett-related; align with the prompt
-
-Line costs (Step 3) — one POST per expense line:
-POST /travelExpense/cost {
-  travelExpense: {id},
-  vatType: {id: X},
-  currency: {id: X},
-  costCategory: {id: X},
-  paymentType: {id: X},
-  amountCurrencyIncVat: X,
-  amountNOKInclVAT: X,
-  date: "YYYY-MM-DD",
-  comments: "..."
-}
-CRITICAL on /travelExpense/cost: **amountCurrencyIncVat** — **NOT** amountCurrencyInclVAT. **amountNOKInclVAT** (exact casing). **comments** — **NOT** description. **paymentType** — **NOT** paymentCurrency. Resolve **`paymentType.id`** with **`GET /travelExpense/paymentType?fields=id`** only — **never** **`fields=…,name`** (**400** *Illegal field… TravelPaymentTypeDTO*; **`TripletexAPI.get`** drops invalid **`fields`**). Resolve **currency** with **`GET /currency`** when needed.
-
-CRITICAL **vatType** on travel **cost** lines — **do not** default **{id: 1}** for every line:
-- Domestic paid costs (flights, taxi, hotel with VAT) often **vatType: {id: 1}** (**25%** / standard — confirm with **GET /ledger/vatType** if unsure).
-- **Per diem** / **diett** lines usually **vatType: {id: 0}** (**no VAT** / exemption) when the task semantics match — **not** **1**.
-- If the enriched **costCategory** includes a **vatType**, prefer **aligning** with that and the line type unless the prompt contradicts.
+**Travel expense:** OpenAPI — trip fields live under **`travelDetails`** on **`POST /travelExpense`** (**departureDate**, **returnDate**, **destination**, **purpose**, …). Then **`POST /travelExpense/perDiemCompensation`** only for **TRAVEL**-type per diem. **Cost lines:** **`POST /travelExpense/cost`** per receipt line — **`amountCurrencyIncVat`**, **`amountNOKInclVAT`**, **`comments`** (not *description*), **`paymentType:{id}`** from **`GET /travelExpense/paymentType?fields=id`**, **`costCategory:{id}`** (list rows are enriched from **`GET /travelExpense/costCategory/{id}`** in **`tripletex_get`** — reuse ids). **`vatType`:** often **{id:1}** for paid domestic costs, **{id:0}** for diett/per diem — align with category + prompt. See Swagger for full **TravelExpense** / **TravelExpenseCost** shapes.
 
 Run payroll (lønn):
 Step 0 — **Active employment + division** (always before **POST /salary/transaction**):
 - **tripletex_get** **`GET /employee/{employeeId}?fields=id,dateOfBirth`** — if **`dateOfBirth`** **null**, **PUT /employee/{id}** **`dateOfBirth`** (prompt or **`1990-01-01`**) **before** creating employment (see Create employee Step 3).
 - **tripletex_get** **`GET /employee/employment?employeeId={employeeId}&fields=id,startDate,division`**
-- If **`values`** is **empty** / no row: **POST /employee/employment** with **only** **`employee: {id}`** and **`startDate`** first (see **Create employee Step 3**). Then **GET** the employment **`id`**; add **`isMainEmployer`**, **`taxDeductionCode`**, **`division`** via **PUT** when the tenant accepts them, or rely on **Step 4** **PUT** **`division`** if **`division`** is still **null** (**PUT** **`1`**; **403** → **2**, **3**; **422** *«Virksomheten…»* → **stop**).
-- If a row exists but **`division`** is **null**: run **Step 4** **`PUT`** sequence above (same **422** rule).
-Step 1 — **GET /salary/type** (before POST) — base: **fastlønn** / **grunnlønn**; bonus: **bonus** / **tillegg**
-Step 2 — **tripletex_post** **POST /salary/transaction** with **`params`** **`{generateTaxDeduction: true}`** and body like:
-{
-  date: "YYYY-MM-DD",   # first day of payroll month (e.g. 2026-03-01 for March run)
-  year: YYYY,
-  month: MM,
-  payslips: [
-    {
-      employee: {id: X},
-      specifications: [
-        {
-          salaryType: {id: FASTLONN_TYPE_ID},
-          amount: BASE_SALARY,
-          count: 1,
-          rate: BASE_SALARY
-        },
-        {
-          salaryType: {id: BONUS_TYPE_ID},
-          amount: BONUS_AMOUNT,
-          count: 1,
-          rate: BONUS_AMOUNT
-        }
-      ]
-    }
-  ]
-}
-CRITICAL: Each **`specifications[]`** line needs **non-null** **`count`** and **`rate`** (OpenAPI **SalarySpecification**) — **422** *«Kan ikke være null»* if omitted. For monthly fixed amounts use **`count: 1`** and **`rate`** equal to **`amount`**. The agent may **auto-fill** missing **`count`/`rate`** when **`amount`** is present.
+- If **`values`** is **empty** / no row: **POST /employee/employment** **`{employee, startDate}`** (runtime tries **`division:{id:1..3}`** on **POST** before minimal — see **Create employee Step 3**). Then **GET** again; if **`division`** still **null**, **Step 4** **PUT** **`division`** (**PUT** **`1`**; **403** → **2**, **3**; **422** *«Virksomheten…»* → **stop**).
+- If a row exists but **`division`** is **null**: run **Step 4** **`PUT`** sequence (same **422** rule).
+Step 0b — **EmploymentDetails** (if task states **% stilling** / **årslønn**): **Create employee Step 3b** — **`POST /employee/employment/details`** with **`employment:{id}`**, **`date`**, **`percentageOfFullTimeEquivalent`**, **`annualSalary`** / **`monthlySalary`** before **salary transaction**.
+Step 1 — **GET /salary/type** — use **`fields=id,name`** only (**`displayName`** **400**; **`TripletexAPI.get`** strips it). Pick **Fastlønn** / **Timelønn** **`id`** from **`values`**.
+Step 2 — **tripletex_post** **POST /salary/transaction** with **`params`** **`{generateTaxDeduction: true}`** and body **`{date, year, month, payslips:[{employee:{id}, specifications:[{salaryType:{id}, amount, count:1, rate: same as amount}, …]}]}`** — each spec line needs **`count`** + **`rate`** (agent may auto-fill from **`amount`**).
 CRITICAL: Use **POST /salary/transaction** for creation (not /salary or /payroll).
 CRITICAL: **/salary/payslip** and **/salary/compilation** are read-only in this flow — do not use them to create payroll data.
 CRITICAL: If salary POST returns **arbeidsforhold** / **virksomhet** errors after Step 4, **do not** issue more **`PUT`** **`division`** if **422** *«Virksomheten kan ikke endres»* already occurred — **runtime may block** further division **PUT**s.
@@ -1499,17 +1925,87 @@ Delete resource:
 
 GET tips:
   - **Invoice lists**: always pass invoiceDateFrom + invoiceDateTo + customerId (if known) + fields=id,invoiceNumber,invoiceDate,amountExcludingVat — never request invalid field names (isPaid, dueDate, amountIncludingVat, paid)
+  - **GET /salary/type**: **`fields=id,name`** only — **`displayName`** is illegal on **SalaryTypeDTO** (**400**); **`TripletexAPI.get`** strips it
   - Use ?fields=id,firstName,lastName to minimize response size
   - Use ?from=0&count=100 for lists
   - Only GET when you genuinely need data not provided in the prompt
 
 ZERO 4xx POLICY: If you are unsure about a field name or required field, use GET first to inspect the data model on one call — then POST correctly. One exploratory GET is better than a failed POST."""
 
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace("86011117947", COMPETITION_BANK_ACCOUNT)
+
 
 _VOUCHER_LIST_POSTINGS_NOTE = (
     "postings stripped for token efficiency — use GET /ledger/voucher/{id} to read specific voucher postings. "
     "If postingsCount is null, the list request omitted postings in fields (count unknown — not zero)."
 )
+
+# Tripletex often returns postings as {id, url} stubs unless `fields` expands nested Posting columns.
+_LEDGER_VOUCHER_DETAIL_DEFAULT_FIELDS = (
+    "id,date,description,number,"
+    "postings(id,row,amountGross,amountGrossCurrency,amount,account(id,number,name))"
+)
+_LEDGER_VOUCHER_DETAIL_POSTINGS_SUFFIX = (
+    "postings(id,row,amountGross,amountGrossCurrency,amount,account(id,number,name))"
+)
+
+
+def _strip_bare_postings_field_token(fields: str) -> tuple[str, bool]:
+    """
+    `fields=id,...,postings` plus auto-append `postings(...)` → Tripletex **400** *Duplicate field postings*.
+    Drop the bare **postings** token so only the nested `postings(...)` remains.
+    """
+    parts = [x.strip() for x in fields.split(",") if x.strip()]
+    if not parts:
+        return "", False
+    out: list[str] = []
+    seen_lower: set[str] = set()
+    changed = False
+    for tok in parts:
+        if tok.lower() == "postings":
+            changed = True
+            continue
+        low = tok.lower()
+        if low in seen_lower:
+            changed = True
+            continue
+        seen_lower.add(low)
+        out.append(tok)
+    return ",".join(out), changed
+
+
+def _ledger_voucher_detail_id_from_path(path: str) -> Optional[str]:
+    p = urlparse(path).path.rstrip("/")
+    parts = [x for x in p.split("/") if x]
+    if len(parts) == 3 and parts[0] == "ledger" and parts[1] == "voucher" and parts[2].isdigit():
+        return parts[2]
+    return None
+
+
+def _augment_ledger_voucher_detail_params(
+    path: str, params: Optional[dict[str, Any]]
+) -> tuple[dict[str, Any], bool]:
+    """Merge `fields` so voucher detail includes posting lines (not id/url-only stubs)."""
+    if _ledger_voucher_detail_id_from_path(path) is None:
+        return dict(params or {}), False
+    p = dict(params or {})
+    raw = p.get("fields")
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        p["fields"] = _LEDGER_VOUCHER_DETAIL_DEFAULT_FIELDS
+        return p, True
+    if not isinstance(raw, str):
+        return p, False
+    cleaned, stripped_bare = _strip_bare_postings_field_token(raw)
+    low = cleaned.lower()
+    if "postings(" in low:
+        p["fields"] = cleaned if cleaned.strip() else _LEDGER_VOUCHER_DETAIL_DEFAULT_FIELDS
+        return p, stripped_bare
+    fs = cleaned.strip().rstrip(",")
+    if not fs:
+        p["fields"] = _LEDGER_VOUCHER_DETAIL_DEFAULT_FIELDS
+        return p, True
+    p["fields"] = f"{fs},{_LEDGER_VOUCHER_DETAIL_POSTINGS_SUFFIX}"
+    return p, True
 
 
 def _strip_ledger_voucher_list_postings(result: Any) -> Any:
@@ -1556,37 +2052,19 @@ def _is_anthropic_rate_limit(err: BaseException) -> bool:
     return "429" in low and ("rate" in low or "token" in low or "limit" in low)
 
 
-def _maybe_warn_invoice_payment_paid_amount(
-    api: "TripletexAPI",
-    path: str,
-    params: Optional[dict[str, Any]],
-) -> None:
-    """
-    Before PUT /invoice/{id}/:payment: if paidAmount is far above Tripletex's open balance,
-    warn — models often send FCY × rate instead of amountOutstanding (NOK).
-    Env: TRIPLETEX_PAYMENT_PAIDAMOUNT_RATIO_WARN (default 5), TRIPLETEX_PAYMENT_PAIDAMOUNT_ABS_WARN (default 5000).
-    """
-    if not params or not isinstance(params, dict):
-        return
-    raw_pa = params.get("paidAmount")
-    if raw_pa is None:
-        return
-    try:
-        paid = float(raw_pa)
-    except (TypeError, ValueError):
-        return
-
+def _invoice_id_from_payment_path(path: str) -> Optional[str]:
     p_path = urlparse(path).path.rstrip("/")
     parts = [x for x in p_path.split("/") if x]
     if len(parts) < 3 or parts[0] != "invoice" or parts[-1] != ":payment":
-        return
+        return None
     inv_id = parts[1]
-    if not inv_id.isdigit():
-        return
+    return inv_id if inv_id.isdigit() else None
 
-    ratio_limit = float(os.environ.get("TRIPLETEX_PAYMENT_PAIDAMOUNT_RATIO_WARN", "5"))
-    abs_floor = float(os.environ.get("TRIPLETEX_PAYMENT_PAIDAMOUNT_ABS_WARN", "5000"))
 
+def _get_invoice_open_balance_for_payment(
+    api: "TripletexAPI", inv_id: str
+) -> tuple[Optional[float], Optional[str]]:
+    """Return (positive outstanding NOK, None) or (None, error_detail) on failure."""
     try:
         snap = api.get(
             f"/invoice/{inv_id}",
@@ -1594,25 +2072,169 @@ def _maybe_warn_invoice_payment_paid_amount(
         )
         val = snap.get("value") if isinstance(snap, dict) else None
         if not isinstance(val, dict):
-            return
+            return None, "GET /invoice/{id} returned no value dict"
         out = val.get("amountOutstanding")
         if out is None:
             out = val.get("amountCurrencyOutstanding")
         if out is None:
-            return
+            return None, "missing amountOutstanding / amountCurrencyOutstanding on invoice"
         try:
             outstanding = float(out)
         except (TypeError, ValueError):
-            return
+            return None, f"non-numeric outstanding: {out!r}"
         if outstanding <= 0:
-            return
-        if paid > ratio_limit * outstanding and paid > abs_floor:
-            _agent_print(
-                f"  ⚠️  WARNING: paidAmount {paid} seems very large — verify this is from "
-                f"amountOutstanding ({outstanding} on GET /invoice/{inv_id}), not FCY × rate."
+            return None, None
+        return outstanding, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _apply_invoice_payment_paid_amount_guard(
+    api: "TripletexAPI",
+    path: str,
+    params: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """
+    Before PUT /invoice/{id}/:payment: if paidAmount is far above Tripletex's open balance,
+    warn / clamp / block — models often send FCY × rate instead of amountOutstanding (NOK).
+
+    Env:
+    - TRIPLETEX_PAYMENT_PAIDAMOUNT_RATIO_WARN (default 5), TRIPLETEX_PAYMENT_PAIDAMOUNT_ABS_WARN (default 5000)
+    - TRIPLETEX_PAYMENT_PAIDAMOUNT_ACTION: warn | clamp | block (default **clamp**)
+    Returns a dict to JSON-return to the model if **block**; otherwise None (params may be mutated in **clamp**).
+    """
+    if not params or not isinstance(params, dict):
+        return None
+    raw_pa = params.get("paidAmount")
+    if raw_pa is None:
+        return None
+    try:
+        paid = float(raw_pa)
+    except (TypeError, ValueError):
+        return None
+
+    inv_id = _invoice_id_from_payment_path(path)
+    if inv_id is None:
+        return None
+
+    ratio_limit = float(os.environ.get("TRIPLETEX_PAYMENT_PAIDAMOUNT_RATIO_WARN", "5"))
+    abs_floor = float(os.environ.get("TRIPLETEX_PAYMENT_PAIDAMOUNT_ABS_WARN", "5000"))
+    action = os.environ.get("TRIPLETEX_PAYMENT_PAIDAMOUNT_ACTION", "clamp").strip().lower()
+    if action not in ("warn", "clamp", "block"):
+        action = "clamp"
+
+    outstanding, err_detail = _get_invoice_open_balance_for_payment(api, inv_id)
+    if err_detail:
+        _agent_print(
+            f"  ⚠️  invoice payment guard: could not read open balance for /invoice/{inv_id}: {err_detail}"
+        )
+        return None
+    if outstanding is None:
+        return None
+
+    if not (paid > ratio_limit * outstanding and paid > abs_floor):
+        return None
+
+    msg_core = (
+        f"paidAmount={paid} is far above GET /invoice/{inv_id} open balance "
+        f"amountOutstanding≈{outstanding} (suspect FCY × payment rate). "
+        f"Use amountOutstanding / amountCurrencyOutstanding from GET /invoice/{inv_id} for full settlement."
+    )
+    if action == "warn":
+        _agent_print(f"  ⚠️  WARNING: {msg_core}")
+        return None
+    if action == "block":
+        _agent_print(f"  🛑  BLOCKED :payment: {msg_core}")
+        return {
+            "error": "invoice_payment_paid_amount_guard",
+            "message": msg_core,
+            "invoiceId": int(inv_id),
+            "paidAmount_requested": paid,
+            "amountOutstanding": outstanding,
+            "hint": "Retry tripletex_put_action with paidAmount equal to amountOutstanding from GET /invoice/{id}.",
+        }
+    # clamp (default)
+    _agent_print(
+        f"  🔧  CLAMPED paidAmount {paid} → {outstanding} (open balance on GET /invoice/{inv_id}); "
+        f"was likely FCY × rate — use API outstanding for :payment."
+    )
+    params["paidAmount"] = outstanding
+    return None
+
+
+def _employee_list_empty_email_error(path: str, params: Optional[dict[str, Any]]) -> Optional[str]:
+    """Step 0 must use a real email from the task/PDF — empty `email` wastes a GET and can mislead the model."""
+    path_only = urlparse(path).path.rstrip("/")
+    if path_only != "/employee":
+        return None
+    p = params or {}
+    if "email" not in p:
+        return None
+    em = p.get("email")
+    if isinstance(em, str) and not em.strip():
+        return (
+            "GET /employee: `email` is empty — invalid for duplicate check (Step 0). "
+            "Read the PDF/task for the new hire's **email**, then "
+            "`GET /employee?email=<exact>&fields=id,firstName,lastName`. "
+            "To page all employees without filtering by email, **omit** the `email` query key entirely."
+        )
+    return None
+
+
+def _reject_manual_voucher_bank_lines(
+    api: "TripletexAPI", postings_lines: list[Any]
+) -> Optional[dict[str, Any]]:
+    """
+    Tripletex rejects manual **tripletex_post_voucher** lines on bank / reconciliation accounts (e.g. 1920).
+    Env **TRIPLETEX_VOUCHER_ALLOW_BANK_LINES** = 1/true — skip this check (sandbox probes only).
+    """
+    if os.environ.get("TRIPLETEX_VOUCHER_ALLOW_BANK_LINES", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
+    norm_lines, _ = _normalize_postings_lines(postings_lines)
+    ids: set[int] = set()
+    for li in norm_lines:
+        if not isinstance(li, dict):
+            continue
+        acc = li.get("account")
+        if not isinstance(acc, dict):
+            continue
+        raw = acc.get("id")
+        if isinstance(raw, int):
+            ids.add(raw)
+        elif isinstance(raw, str) and raw.strip().isdigit():
+            ids.add(int(raw.strip()))
+    for aid in sorted(ids):
+        try:
+            snap = api.get(
+                f"/ledger/account/{aid}",
+                params={"fields": "id,number,isBankAccount,name"},
             )
-    except Exception:
-        pass
+        except Exception as e:
+            _agent_print(
+                f"  ⚠️  voucher bank-line guard: GET /ledger/account/{aid} failed: {type(e).__name__}: {e}"
+            )
+            continue
+        val = snap.get("value") if isinstance(snap, dict) else None
+        if not isinstance(val, dict):
+            continue
+        if val.get("isBankAccount") is True:
+            num = val.get("number", aid)
+            return {
+                "error": "manual_voucher_bank_account",
+                "message": (
+                    f"Posting uses bank/reconciliation account {num} (id {aid}). "
+                    "Tripletex rejects manual postings to bank accounts — use :payment / bank flows instead, "
+                    "or book valutagevinst/-tap with non-bank accounts (8060/8160 with 1500/2900 per SYSTEM_PROMPT)."
+                ),
+                "accountId": aid,
+                "accountNumber": num,
+            }
+    return None
 
 
 # ── Tool executor ─────────────────────────────────────────────────────────────
@@ -1620,17 +2242,78 @@ def _maybe_warn_invoice_payment_paid_amount(
 def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
     try:
         if name == "tripletex_get":
-            result = api.get(inp["path"], inp.get("params", {}))
-            path_only = urlparse(inp["path"]).path.rstrip("/")
+            req_path = inp["path"]
+            raw_params = inp.get("params", {}) or {}
+            emp_err = _employee_list_empty_email_error(req_path, raw_params)
+            if emp_err is not None:
+                _agent_print(f"  ℹ️  {emp_err}")
+                return json.dumps({"error": emp_err}, ensure_ascii=False)
+            params_in, vdetail_aug = _augment_ledger_voucher_detail_params(req_path, raw_params)
+            result = api.get(req_path, params_in)
+            sanitize_notes = api.pop_get_tool_notes()
+            path_only = urlparse(req_path).path.rstrip("/")
             if path_only == "/ledger/voucher":
                 result = _strip_ledger_voucher_list_postings(result)
+            elif vdetail_aug and isinstance(result, dict):
+                result = dict(result)
+                note = (
+                    "GET /ledger/voucher/{id}: `fields` expanded to include postings (amounts + account); "
+                    "without postings(...) the API often returns id/url-only stubs."
+                )
+                prev = result.get("_toolNote")
+                result["_toolNote"] = f"{prev} {note}".strip() if isinstance(prev, str) and prev.strip() else note
+            if sanitize_notes and isinstance(result, dict):
+                result = dict(result)
+                gnote = " ".join(sanitize_notes)
+                prev = result.get("_toolNote")
+                result["_toolNote"] = f"{prev} {gnote}".strip() if isinstance(prev, str) and prev.strip() else gnote
+            if path_only == "/ledger/account":
+                pchk = params_in if isinstance(params_in, dict) else {}
+                num_raw = pchk.get("number")
+                num_ok = num_raw is not None and (not isinstance(num_raw, str) or num_raw.strip() != "")
+                if not num_ok:
+                    _agent_print(
+                        "  ⚠️  GET /ledger/account **without** query **`number`** — full list / pagination wastes "
+                        "**proxy** calls; use **`?number=NNNN&fields=id,number,name`** for each GL the task names."
+                    )
+                    if isinstance(result, dict):
+                        result = dict(result)
+                        w = (
+                            "**Efficiency:** use **`GET /ledger/account?number=<kontonummer>&fields=id,number,name`** "
+                            "per stated account — avoid chart-wide **`from`/`count`** unless unavoidable."
+                        )
+                        prev = result.get("_toolNote")
+                        result["_toolNote"] = f"{prev} {w}".strip() if isinstance(prev, str) and prev.strip() else w
+                else:
+                    vals = result.get("values") if isinstance(result, dict) else None
+                    if (
+                        isinstance(result, dict)
+                        and isinstance(vals, list)
+                        and len(vals) == 1
+                        and isinstance(vals[0], dict)
+                    ):
+                        qnote = _ledger_account_3400_fee_credit_quirk_note(num_raw, vals[0])
+                        if qnote:
+                            _agent_print(
+                                "  ⚠️  GET /ledger/account **3400**: **`name`** looks like **tilskudd** — "
+                                "may be wrong **credit** for **purregebyr**; see **`_toolNote`**."
+                            )
+                            result = dict(result)
+                            prev = result.get("_toolNote")
+                            result["_toolNote"] = (
+                                f"{prev} {qnote}".strip()
+                                if isinstance(prev, str) and prev.strip()
+                                else qnote
+                            )
             text = json.dumps(result, ensure_ascii=False)
-            # Voucher lists carry heavy postings — allow larger preview than default GET cap.
-            limit = (
-                int(os.environ.get("TRIPLETEX_GET_LEDGER_VOUCHER_LIST_CHARS", "12000"))
-                if path_only == "/ledger/voucher"
-                else int(os.environ.get("TRIPLETEX_GET_RESULT_CHARS", "6000"))
-            )
+            # Voucher lists / detail with expanded postings — larger preview than default GET cap.
+            detail_id = _ledger_voucher_detail_id_from_path(req_path)
+            if path_only == "/ledger/voucher":
+                limit = int(os.environ.get("TRIPLETEX_GET_LEDGER_VOUCHER_LIST_CHARS", "12000"))
+            elif detail_id:
+                limit = int(os.environ.get("TRIPLETEX_GET_LEDGER_VOUCHER_DETAIL_CHARS", "14000"))
+            else:
+                limit = int(os.environ.get("TRIPLETEX_GET_RESULT_CHARS", "6000"))
             return text[:limit]
 
         elif name == "tripletex_post":
@@ -1680,24 +2363,70 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
             post_params = inp.get("params")
             if post_params is not None and not isinstance(post_params, dict):
                 post_params = None
+            if path_only == "/supplierInvoice":
+                fp0 = _supplier_invoice_body_fingerprint(body_out)
+                bk0 = getattr(api, "supplier_invoice_500_seen", None)
+                if bk0 is not None and fp0 in bk0:
+                    _agent_print(
+                        "  ℹ️  Skipping POST /supplierInvoice — HTTP 500 code 1000 already hit for this invoiceNumber+supplier."
+                    )
+                    return json.dumps(
+                        {
+                            "skipped": True,
+                            "_toolNote": (
+                                "Duplicate POST /supplierInvoice blocked for this invoiceNumber+supplier (already HTTP 500 code 1000). "
+                                "Use tripletex_post_voucher — expense + inngående MVA + 2400 with supplier on the credit line."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
             try:
-                result = api.post(path, body_out, params=post_params)
-            except requests.HTTPError as e:
-                if (
-                    path_only == "/employee/employment"
-                    and e.response is not None
-                    and e.response.status_code == 404
-                    and not _is_minimal_employment_post_body(body_out)
-                ):
-                    emp = body_out.get("employee")
-                    sd = body_out.get("startDate")
-                    if isinstance(emp, dict) and emp.get("id") is not None and sd:
-                        minimal = {"employee": {"id": emp["id"]}, "startDate": sd}
+                if path_only == "/employee/employment":
+                    seq = _employment_post_attempt_sequence(body_out)
+                    if len(seq) > 1:
+                        _agent_print(
+                            "  ℹ️  POST /employee/employment: try **division:{id:1..3}** on create; "
+                            "each **HTTP 404** → next id, then minimal `{employee, startDate}`."
+                        )
+                    result: Optional[dict[str, Any]] = None
+                    last_err: Optional[requests.HTTPError] = None
+                    for idx, bod in enumerate(seq):
                         try:
-                            result = api.post(path, minimal, params=post_params)
-                            return json.dumps(result, ensure_ascii=False)
-                        except requests.HTTPError as e2:
-                            raise e2 from e
+                            result = api.post(path, bod, params=post_params)
+                            last_err = None
+                            break
+                        except requests.HTTPError as e:
+                            last_err = e
+                            resp = e.response
+                            if (
+                                resp is not None
+                                and resp.status_code == 404
+                                and idx + 1 < len(seq)
+                            ):
+                                continue
+                            if (
+                                resp is not None
+                                and resp.status_code == 404
+                                and not _is_minimal_employment_post_body(bod)
+                            ):
+                                emp = bod.get("employee")
+                                sd = bod.get("startDate")
+                                if isinstance(emp, dict) and emp.get("id") is not None and sd:
+                                    minimal = {"employee": {"id": emp["id"]}, "startDate": sd}
+                                    try:
+                                        result = api.post(path, minimal, params=post_params)
+                                        last_err = None
+                                        break
+                                    except requests.HTTPError as e2:
+                                        last_err = e2
+                            break
+                    if last_err is not None:
+                        raise last_err
+                    if result is None:
+                        raise RuntimeError("POST /employee/employment: no result after attempt sequence")
+                else:
+                    result = api.post(path, body_out, params=post_params)
+            except requests.HTTPError as e:
                 if (
                     path_only == "/salary/transaction"
                     and e.response is not None
@@ -1712,13 +2441,54 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                             api,
                             _employee_ids_from_salary_transaction_body(body_out),
                         )
+                if (
+                    path_only == "/supplierInvoice"
+                    and e.response is not None
+                    and e.response.status_code == 500
+                ):
+                    raw = (e.response.text or "").replace(" ", "")
+                    if '"code":1000' in raw or '"code":1000,' in raw:
+                        fp = _supplier_invoice_body_fingerprint(body_out)
+                        bk = getattr(api, "supplier_invoice_500_seen", None)
+                        if bk is not None:
+                            bk.add(fp)
+                        _agent_print(
+                            "  ℹ️  POST /supplierInvoice → HTTP 500 code 1000 — use voucher fallback or order/invoice path; "
+                            "see _toolNote in tool result."
+                        )
+                        detail = (e.response.text or "")[:800]
+                        return json.dumps(
+                            {
+                                "http_error": 500,
+                                "details": detail,
+                                "_toolNote": (
+                                    "POST /supplierInvoice returned HTTP 500 code 1000 (no validation detail) on this tenant. "
+                                    "Do NOT call tripletex_post /supplierInvoice again for this invoiceNumber+supplier — "
+                                    "the runtime will block duplicates. Use tripletex_post_voucher now: debit expense (+ vatType 1 if one-line VAT), "
+                                    "debit/credit 2710 split if you use separate VAT line, credit 2400 with supplier:{id} on AP line."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
                 raise
             return json.dumps(result, ensure_ascii=False)
 
         elif name == "tripletex_post_voucher":
+            v_bank_err = _reject_manual_voucher_bank_lines(api, inp.get("postings") or [])
+            if v_bank_err is not None:
+                return json.dumps(v_bank_err, ensure_ascii=False)
             extras = inp.get("shell_extras")
             if extras is not None and not isinstance(extras, dict):
                 extras = None
+            cust = inp.get("customer")
+            if not (isinstance(cust, dict) and cust.get("id") is not None):
+                sup_root = inp.get("supplier")
+                if isinstance(sup_root, dict) and sup_root.get("id") is not None:
+                    cust = {"id": sup_root["id"]}
+            if isinstance(cust, dict) and cust.get("id") is not None:
+                merged = dict(extras or {})
+                merged["customer"] = cust
+                extras = merged
             result = post_voucher_two_step(
                 api,
                 date=inp["date"],
@@ -1769,7 +2539,9 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
             p_action = inp.get("path") or ""
             prms = inp.get("params")
             if isinstance(prms, dict) and urlparse(p_action).path.rstrip("/").endswith("/:payment"):
-                _maybe_warn_invoice_payment_paid_amount(api, p_action, prms)
+                pay_block = _apply_invoice_payment_paid_amount_guard(api, p_action, prms)
+                if pay_block is not None:
+                    return json.dumps(pay_block, ensure_ascii=False)
             result = api.put_action(
                 p_action,
                 params=prms,
@@ -1798,6 +2570,82 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+def _pdf_employee_context_hint(files: list[FileAttachment], prompt: str) -> Optional[str]:
+    """Short reminder when a PDF is attached and the task looks like hiring / employee setup."""
+    if not any((f.mime_type or "").strip() == "application/pdf" for f in files):
+        return None
+    p = (prompt or "").lower()
+    if not any(
+        w in p
+        for w in (
+            "ansatt",
+            "arbeidsforhold",
+            "ansett",
+            "tilbud",
+            "kontrakt",
+            "lønn",
+            "employee",
+            "employment",
+            "onboard",
+            "hire",
+            "payroll",
+            "salary",
+            # French offer-letter / HR PDF tasks
+            "embauche",
+            "employé",
+            "employe",
+            "salaire",
+            "contrat",
+            "intégration",
+            "integration",
+        )
+    ):
+        return None
+    return (
+        "[PDF + HR/personal] Les PDF-en for faktisk arbeids-e-post, avdelingsnavn, startdato og lønn der det finnes. "
+        "Ikke kall GET /employee med tom e-post. Match avdeling med GET /department før eventuell POST /department."
+    )
+
+
+def _pdf_supplier_invoice_context_hint(files: list[FileAttachment], prompt: str) -> Optional[str]:
+    """Reminder when a PDF is attached and the task looks like supplier invoice registration."""
+    if not any((f.mime_type or "").strip() == "application/pdf" for f in files):
+        return None
+    p = (prompt or "").lower()
+    supplierish = any(
+        w in p
+        for w in (
+            "fornecedor",
+            "proveedor",
+            "fournisseur",
+            "leverandør",
+            "leverandørfaktura",
+            "leverandorfaktura",
+            "supplier invoice",
+            "supplier",
+        )
+    )
+    invoiceish = any(
+        w in p
+        for w in (
+            "fatura",
+            "factura",
+            "faktura",
+            "invoice",
+            "registe",
+            "registrar",
+            "registrer",
+        )
+    )
+    if not (supplierish and invoiceish):
+        return None
+    return (
+        "[PDF + leverandørfaktura] Les PDF for leverandørnavn, org.nr., fakturanummer, dato, beløp inkl. MVA og kostnadstype. "
+        "Opprett leverandør (GET orgnr → POST/PUT isCustomer:false). Hvis POST /supplierInvoice gir HTTP 500 kode 1000: "
+        "ikke gjenta samme POST — bruk tripletex_post_voucher (kostnad + 2710 inngående + 2400 med supplier på kreditlinjen)."
+    )
 
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
@@ -1863,6 +2711,13 @@ def run_agent(prompt: str, api: TripletexAPI, files: list[FileAttachment]) -> No
                 + ", ".join(unhandled_attachments)
             ),
         })
+
+    hint = _pdf_employee_context_hint(files, prompt)
+    if hint:
+        content.append({"type": "text", "text": hint})
+    hint_sup = _pdf_supplier_invoice_context_hint(files, prompt)
+    if hint_sup:
+        content.append({"type": "text", "text": hint_sup})
 
     content.append({"type": "text", "text": prompt})
     messages = [{"role": "user", "content": content}]
@@ -1959,6 +2814,11 @@ def _run_solve_sync(req: SolveRequest, task_label: str, ts: str) -> None:
         _agent_print(f"📋 PROMPT (preview)  {req.prompt[:200]}{'…' if len(req.prompt) > 200 else ''}")
         _agent_print(f"📎 FILES        {[f.filename for f in req.files]}")
         _agent_print(f"{'='*60}")
+        if str(task_label).startswith("(not set"):
+            _agent_print(
+                "  ⚠️  task_id not set — use JSON **task_id**, header **X-Task-Id**, or env **TASK_ID** / **NM_TASK_ID** "
+                "for traceable logs and grader correlation."
+            )
 
         api = TripletexAPI(
             req.tripletex_credentials.base_url,

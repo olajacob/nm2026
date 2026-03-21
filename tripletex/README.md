@@ -83,15 +83,41 @@ Ved **500 / code 1000** på siste kall: legg til **`invoiceDueDate`** (f.eks. 14
 
 ## Testflyt før nye runs
 
-1. **Tripletex-token:** `export TRIPLETEX_SESSION_TOKEN='…'` (hele base64-strengen). Valgfritt: `export TRIPLETEX_BASE_URL=…` hvis ikke standard sandbox.
+1. **Tripletex-token:** Legg **`TRIPLETEX_SESSION_TOKEN=…`** i **`nmai2026/.env`** (hele base64-strengen), eller `export` i skallet. Valgfritt: **`TRIPLETEX_BASE_URL`**. `test_sandbox.py` / `smoke_sandbox.py` leser **`../.env`** automatisk hvis variabelen ikke allerede er satt.
 2. **Rask sjekk:** `python smoke_sandbox.py` — kun `whoAmI`.
 3. **Bredere sjekk:** `python test_sandbox.py` — `whoAmI`, lesbar konto **1920**, liten `customer`-liste. Valgfritt med kjørende agent:  
-   `python test_sandbox.py --health-url http://127.0.0.1:8080`
+   `python test_sandbox.py --health-url http://127.0.0.1:8080`  
+   **Leverandørfaktura-API:** `python test_sandbox.py --supplier-invoice` — oppretter engangs-leverandør (unikt org.nr) og **`POST /supplierInvoice`** (1000 NOK); ved **500** prøves én gang med **`invoiceDueDate`**.  
+   **Bilag / `tripletex_post_voucher`:**  
+   - `python test_sandbox.py --voucher` — **2-linjers** bilag (standard **2900** +100 / **2400** −100).  
+   - `python test_sandbox.py --voucher-vat` — **3-linjers** MVA-mønster (**7300** +800 med `vatType` 1 / **2710** +200 / **2400** −1000), lik mange leverandør-/kostnadsbilag i logger.  
+   - `python test_sandbox.py --ledger-probe` — **hovedbok-flyt:** liste med periode, forrige måned (tom OK), rå **`GET /ledger/voucher/{id}`** (forventer ofte posting-stubber), **`execute_tool`** med auto-**`fields`** (beløp + konto), **`GET /ledger/posting/{id}`**, mini-aggregering, **`POST /project`**. Tøm måned → oppretter testbilag (**6800**/**1920** som standard; overstyres med **`TRIPLETEX_LEDGER_PROBE_DEBIT_NUMBER`** / **`_CREDIT_NUMBER`**).  
+   - `python test_sandbox.py --invoice-fee-probe` — **faktura/purring:** **`execute_tool`** saniterer **`dueDate`→`invoiceDueDate`**, **`post_voucher`** **1500/3400** med **`shell_extras.customer`**, kontonavn **8040/8050**, **`amountOutstanding`**-sample, hint om **`:payment`**.  
+   - `python test_sandbox.py --month-end-probe` — **månedsslutt:** **`GET /ledger/voucher/{id}`** med **`fields=…,postings`** (naken token) skal **ikke** gi **400** duplikat; pluss **GET /ledger/account** **1710** / **1290** / **6010**.  
+   Overstyr kontonumre med miljø (i `.env` eller `export`):
+
+   | Variabel | Brukes av | Standard |
+   |----------|-----------|----------|
+   | `TRIPLETEX_VOUCHER_DEBIT_NUMBER` | `--voucher` (debet) | `2900` |
+   | `TRIPLETEX_VOUCHER_CREDIT_NUMBER` | `--voucher` (kredit) | `2400` |
+   | `TRIPLETEX_VOUCHER_EXPENSE_NUMBER` | `--voucher-vat` (kostnad) | `7300` |
+   | `TRIPLETEX_VOUCHER_VAT_NUMBER` | `--voucher-vat` (inngående MVA) | `2710` |
+   | `TRIPLETEX_VOUCHER_AP_NUMBER` | `--voucher-vat` (leverandørgjeld) | `2400` |
+
+   Logger samme **fallback-rekkefølge** som agenten. **`send_to_ledger: false`**. På enkelte sandbox-tenanter feiler fortsatt **alle** steg (kjent problem) — da er testen **diagnostikk**, ikke blokkering for innsending.
 4. **Ende-til-ende (koster LLM):** Fyll inn `session_token` i `examples/solve_smoke.json`, start agenten, deretter  
    `curl -s -X POST http://127.0.0.1:8080/solve -H "Content-Type: application/json" -d @examples/solve_smoke.json`  
    (legg til `Authorization: Bearer …` hvis `API_KEY` er satt på serveren).
 
 Først når steg 2–3 er grønne (og ev. 4 ved behov), kjør «ekte» konkurranseruns mot sandbox.
+
+## Innsending — når skal dere submitte igjen?
+
+- **Tripletex (NM-plattformen):** Submit **agent-endringer** når dere har landet en forbedring dere vil ha **scoret** (innebygde forsøksgrenser gjelder). Det er **ingen** krav om at `--voucher` / `--supplier-invoice` er grønne på sandbox — mange feil ligger i **tenant/API**, ikke nødvendigvis i koden. Kjør `test_sandbox.py` uten ekstra flagg før innsending for å bekrefte **token + whoAmI**; bruk `--voucher*` / `--supplier-invoice` som **valgfri** regresjonstest.
+- **GitHub + MIT-lisens:** Frist i **`data.json`** (per nå **22. mars kl. 15:00**, år som i filen) — **siste frist** for å pushe kode som teller med i konkurransen. Oppdater `data.json` manuelt hvis arrangøren endrer tidspunkt.
+- **NorgesGruppen (annen oppgave):** Følg **egne** innleveringsvinduer / zip-regler fra NM — ikke bland med Tripletex-submit.
+
+**Praktisk:** Etter hver **meningsfull** `agent.py`-endring dere vil ha vurdert i gradering: **submit på NM** (innen antall forsøk dere har). Før **GitHub-fristen**: siste push med **MIT** og alt dere vil stå på.
 
 ## Utvikler-dashboard
 

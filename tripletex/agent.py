@@ -690,6 +690,7 @@ def post_voucher_two_step(
                 "  ℹ️  voucher: inline `postings` still 422 after dropping sendToLedger query — "
                 "trying body key `posting` (singular)."
             )
+            _agent_print("  ℹ️  attempt 2b: trying singular 'posting' field name")
             # --- 2b) Singular top-level key "posting" (some OpenAPI / proxy stacks differ) ---
             singular_body: dict[str, Any] = {**shell_base, "posting": norm_lines}
             try:
@@ -896,7 +897,7 @@ TOOLS = [
         "description": (
             "POST request to create a resource in Tripletex.\n"
             "Common paths: /employee, /employee/employment, /customer, /product, /activity, /order, "
-            "/supplierInvoice (register **leverandørfaktura** — **`invoiceDate`**, **`supplier`** required; see SYSTEM_PROMPT), "
+            "/supplierInvoice (register **leverandørfaktura** — **`invoiceNumber`**, **`invoiceDate`**, **`supplier`**, **`amountCurrency`**, **`currency`**; see SYSTEM_PROMPT **Register supplier invoice**), "
             "/project, /project/hourlyRates, /timesheet/entry, /department (POST {name} — **one POST per department**), /travelExpense, "
             "/travelExpense/perDiemCompensation, /travelExpense/cost, /ledger/accountingDimensionName ({dimensionName}), "
             "/ledger/accountingDimensionValue ({displayName})\n"
@@ -1183,8 +1184,12 @@ Register supplier invoice (leverandørfaktura) — **Task 23 pattern** (mottatt 
 When the task is to **record** / **register** / **book** a **received supplier invoice** (amount **TTC** / **inkl. MVA**, invoice number, cost account like **7300**), you **must** create the **supplier invoice** in Tripletex — **not** stop after **`POST /customer`**. **Do not** use **`tripletex_post_voucher`** / **`/ledger/voucher`** for this flow unless the tenant truly exposes no **`/supplierInvoice`** create — **primary path:** **`tripletex_post`** **`POST /supplierInvoice`**.
 
 1. **Supplier:** **`GET /customer?organizationNumber=X&fields=id,name,organizationNumber,isSupplier`** (and **`email`** if needed). If **no row**, **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**, **`name`**, **`organizationNumber`**, **`email`** when stated. **`supplier_id`** = matching **`values[].id`** from **GET**, or **`value.id`** from **`POST /customer`** (same resource as supplier in Tripletex).
-2. **Cost / expense account:** **one** **`GET /ledger/account?number=NNNN&fields=id,number,name`** for the **stated** GL (**7300**, etc.) — **do not** scan many account numbers «just in case»; only add extra **`GET`** if the task names additional codes or **`POST /supplierInvoice`** **422** requires another account **id**.
-3. **Create invoice:** **`tripletex_post`** **`POST /supplierInvoice`** with JSON body per **Swagger / [v2-docs](https://tripletex.no/v2-docs/)** — typically **`invoiceDate`** (**required**) and **`supplier: {id}`** (**required**). Example shape (add/remove fields per live OpenAPI): **`invoiceNumber`**, **`invoiceDate`**, **`invoiceDueDate`** if required, **`supplier: {id: supplier_id}`**, **`amountCurrency`** = amount **including VAT** when the prompt gives **TTC** / **inkl. MVA**, **`currency: {id: 1}`** (NOK), **`comment`** or **`invoiceComment`** if supported, and **`orderLines`** / expense lines if the API requires lines (use **`product`** or cost line pattern per **SupplierInvoice** / **OrderLine** docs — map the task’s cost account to the line’s **`account`** / **`vatType`** as Swagger specifies). **Never** `end_turn` after only step **1–2**.
+2. **Cost / expense account:** **one** **`GET /ledger/account?number=NNNN&fields=id,number,name`** for the **stated** GL (**7300**, etc.) — **do not** scan many account numbers «just in case»; use for **follow-up** (voucher / line edits) only after **`POST /supplierInvoice`** succeeds **or** if the API documents a **required** field you still lack.
+3. **Create invoice — `POST /supplierInvoice`:** Bare **`invoiceNumber`** + **`invoiceDate`** + **`supplier`** uten beløp ga **HTTP 500** (code **1000**) i live-test — sannsynlig **manglende påkrevd felt**. **Standard body** (beløp **inkl. MVA** som oppgaven oppgir som TTC / inkl. MVA / «inklusive»):
+```json
+{"invoiceNumber": "INV-...", "invoiceDate": "YYYY-MM-DD", "supplier": {"id": supplier_id}, "amountCurrency": AMOUNT_INCL_VAT, "currency": {"id": 1}}
+```
+**`amountCurrency`** = total i **selskapets valuta** (NOK → **`currency: {id: 1}`**). **Do NOT** include **`comment`**, **`account`** on **`orderLines[]`**, or **`orderLines`** with an **`account`** field (422 *Feltet eksisterer ikke*). **If still HTTP 500** etter dette: **retry once** med samme body pluss **`invoiceDueDate`** (**YYYY-MM-DD**, f.eks. 14 dager etter fakturadato hvis oppgaven ikke sier noe). **Never** `end_turn` after only step **1–2**.
 4. **Approve / attest:** if the task says **approve**, **attestere**, **bokfør**, **godkjenn**, etc.: **`tripletex_put_action`** **`PUT /supplierInvoice/{invoiceId}/:approve`** (OpenAPI uses **PUT**, optional query **`comment`**) — or **`PUT /supplierInvoice/:approve`** with **`invoiceIds`** query for batch, per Swagger. There is **no** **`:book`** in standard v2 paths — use **`:approve`** (and tenant UI wording may differ).
 
 **Do not** `end_turn` with only supplier master data and ledger **GET**s — the **`POST /supplierInvoice`** (and **`:approve`** if asked) **must** run.

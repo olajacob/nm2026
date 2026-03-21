@@ -1,0 +1,9 @@
+======== ROUND 1 SID=dc51cee096a14740b8a1ed2409d8462a ========
+{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}
+{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}
+{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}
+event: message
+data: {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"No results found for 'NorgesGruppen examples'"}],"structuredContent":{"result":"No results found for 'NorgesGruppen examples'"},"isError":false}}
+
+
+{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}

@@ -1,0 +1,21 @@
+{
+  "overview": [
+    {
+      "query": "NorgesGruppen",
+      "text": "## challenge://google-cloud/deploy\n\n| Astar Island | HTTPS endpoint (`/solve`) | Yes |\n| NorgesGruppen Data | Code upload (`.zip`) | No |\n\n\n========\n\n## challenge://norgesgruppen-data/examples\n\n# NorgesGruppen Data: Examples & Tips\n\n## Random Baseline\n\n========\n\n## challenge://norgesgruppen-data/overview\n\n# NorgesGruppen Data: Object Detection\n\nDetect grocery products on store shelves. Upload your model code as a `.zip` file — it runs in a sandboxed Docker container on our servers.\n\n========\n\n## challenge://norgesgruppen-data/scoring\n\n# NorgesGruppen Data: Scoring\n\n## Hybrid Scoring\n\n========\n\n## challenge://norgesgruppen-data/submission\n\n# NorgesGruppen Data: Submission Format\n\n## Zip Structure"
+    }
+  ],
+  "submission": [
+    {
+      "query": "Zip Structure",
+      "text": "## challenge://norgesgruppen-data/submission\n\n\n## Zip Structure\n\nYour `.zip` must contain `run.py` at the root. You may include model weights and Python helper files."
+    }
+  ],
+  "scoring": [
+    {
+      "query": "mAP@0.5",
+      "text": "## challenge://norgesgruppen-data/scoring\n\n\nBoth components use mAP@0.5 (Mean Average Precision at IoU threshold 0.5).\n\n### Detection mAP (70% of score)"
+    }
+  ],
+  "examples": []
+}

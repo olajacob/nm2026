@@ -1,0 +1,10 @@
+.env
+tripletex/logs/
+.env
+__pycache__/
+*.pyc
+yolo_dataset/
+runs/
+*.pt
+submission.zip
+yolov8n.pt

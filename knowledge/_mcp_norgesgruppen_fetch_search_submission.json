@@ -1,0 +1,3 @@
+event: message
+data: {"jsonrpc":"2.0","id":22,"result":{"content":[{"type":"text","text":"No results found for 'norgesgruppen submission zip structure predict requirements'"}],"structuredContent":{"result":"No results found for 'norgesgruppen submission zip structure predict requirements'"},"isError":false}}
+

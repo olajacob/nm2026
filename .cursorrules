@@ -1,0 +1,19 @@
+---
+# NM i AI 2026 — Competition Context
+
+## Three independent tasks:
+
+### 1. Astar Island (astar/)
+- Predict Norse civilisation terrain after 50-year simulation
+- 40x40 map, 6 terrain classes, W×H×6 probability
+
+### 2. Tripletex (tripletex/)
+- Task and API specifics: follow official competition materials and Tripletex track instructions during the event.
+
+### 3. NorgesGruppen (norgesgruppen/)
+- Task specifics: follow official competition materials and NorgesGruppen track instructions during the event.
+
+## Repo conventions
+- Target Python 3.12 for Python code in this repository.
+- Persistent project knowledge: read `knowledge/INDEX.md` at session start; load category files only as needed; log issues to `knowledge/ERRORS.md`.
+---

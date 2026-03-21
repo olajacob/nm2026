@@ -1,0 +1,138 @@
+{
+  "challenge://norgesgruppen-data/overview": [
+    {
+      "q": "extra:Classification",
+      "len": 1507
+    },
+    {
+      "q": "extra:run.py",
+      "len": 1197
+    },
+    {
+      "q": "extra:GPU",
+      "len": 2155
+    },
+    {
+      "q": "extra:bbox",
+      "len": 1183
+    },
+    {
+      "q": "NorgesGruppen",
+      "len": 704
+    }
+  ],
+  "challenge://norgesgruppen-data/submission": [
+    {
+      "q": "extra:Classification",
+      "len": 1507
+    },
+    {
+      "q": "extra:run.py",
+      "len": 1197
+    },
+    {
+      "q": "extra:GPU",
+      "len": 2155
+    },
+    {
+      "q": "extra:CPU",
+      "len": 1592
+    },
+    {
+      "q": "extra:bbox",
+      "len": 1183
+    },
+    {
+      "q": "extra:IoU",
+      "len": 1587
+    },
+    {
+      "q": "batch2:run.py Contract",
+      "len": 94
+    },
+    {
+      "q": "batch2:python run.py",
+      "len": 127
+    },
+    {
+      "q": "batch2:Creating Your Zip",
+      "len": 593
+    },
+    {
+      "q": "batch2:predictions.json",
+      "len": 547
+    },
+    {
+      "q": "Zip Structure",
+      "len": 166
+    }
+  ],
+  "challenge://norgesgruppen-data/scoring": [
+    {
+      "q": "extra:30% of score",
+      "len": 135
+    },
+    {
+      "q": "extra:Classification",
+      "len": 1507
+    },
+    {
+      "q": "extra:public leaderboard",
+      "len": 389
+    },
+    {
+      "q": "extra:Mean Average Precision",
+      "len": 152
+    },
+    {
+      "q": "extra:IoU",
+      "len": 1587
+    },
+    {
+      "q": "Score = 0.7 \u00d7 detection_mAP",
+      "len": 106
+    }
+  ],
+  "challenge://norgesgruppen-data/examples": [
+    {
+      "q": "extra:Classification",
+      "len": 1507
+    },
+    {
+      "q": "extra:run.py",
+      "len": 1197
+    },
+    {
+      "q": "extra:GPU",
+      "len": 2155
+    },
+    {
+      "q": "extra:CPU",
+      "len": 1592
+    },
+    {
+      "q": "extra:bbox",
+      "len": 1183
+    },
+    {
+      "q": "extra:Random Baseline",
+      "len": 423
+    },
+    {
+      "q": "batch2:Creating Your Zip",
+      "len": 593
+    },
+    {
+      "q": "batch2:predictions.json",
+      "len": 547
+    },
+    {
+      "q": "Security scan found violations",
+      "len": 428
+    },
+    {
+      "q": "Timed out after 300s",
+      "len": 425
+    }
+  ]
+}

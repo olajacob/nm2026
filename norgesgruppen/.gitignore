@@ -1,0 +1,7 @@
+yolo_dataset/
+runs/
+__pycache__/
+*.py[cod]
+.DS_Store
+model.pt
+wandb/

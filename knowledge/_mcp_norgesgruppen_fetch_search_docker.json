@@ -1,0 +1,3 @@
+event: message
+data: {"jsonrpc":"2.0","id":24,"result":{"content":[{"type":"text","text":"No results found for 'norgesgruppen docker sandbox inference'"}],"structuredContent":{"result":"No results found for 'norgesgruppen docker sandbox inference'"},"isError":false}}
+

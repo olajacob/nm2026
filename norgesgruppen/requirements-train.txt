@@ -1,0 +1,11 @@
+# ultralytics pinned to match competition sandbox (8.1.0).
+ultralytics==8.1.0
+
+# Broad pins — OK for local macOS (e.g. torch 2.8.x from pip).
+# Sandbox uses torch 2.6.0+cu124 + torchvision 0.21.0+cu124. If you want
+# minimal risk of load quirks when reusing the same .pt on the server, train
+# in a separate venv with exact sandbox wheels, e.g.:
+#   pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+#   pip install ultralytics==8.1.0
+torch>=2.6.0
+torchvision>=0.21.0

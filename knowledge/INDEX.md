@@ -1,19 +1,31 @@
 # Knowledge base — NM i AI 2026
 
-**Start here each session.** Load category files on demand (progressive disclosure); don’t read everything unless the task crosses tracks.
+**Start each session here.** Load **only** the files that match the task (progressive disclosure). Full narrative docs remain as siblings for deep dives.
 
-## Categories
+## Routing
 
-| File | Use when |
-|------|----------|
-| [repo.md](repo.md) | Layout, Python version, env vars, generic workflows |
-| [tripletex.md](tripletex.md) | Tripletex agent, REST v2, auth, invoice/order flow, tools (`TRIPLETEX.md` in docs = same file on case-insensitive disks) |
-| [astar.md](astar.md) | Astar Island task, terrain prediction, client stubs |
-| [norgesgruppen.md](norgesgruppen.md) | NorgesGruppen track (placeholder until brief exists) |
-| [ERRORS.md](ERRORS.md) | Error log — check before debugging recurring failures |
+| Context | Open |
+|--------|------|
+| **Tripletex API** work (auth, 1920, VAT, invoices, supplierInvoice, vouchers, 429/403) | [tripletex/api-quirks.md](tripletex/api-quirks.md) |
+| **Tripletex task** investigation (01–30 patterns, gaps vs leader) | [tripletex/task-registry.md](tripletex/task-registry.md) |
+| **Tripletex scoring / strategy / efficiency / infra** | [tripletex/scoring.md](tripletex/scoring.md) |
+| Tripletex long-form (bank CSV, flows) | [tripletex.md](tripletex.md) |
+| **NorgesGruppen** training, mAP, submissions | [norgesgruppen/model.md](norgesgruppen/model.md) |
+| **NorgesGruppen** sandbox, zip, blocked imports | [norgesgruppen/sandbox.md](norgesgruppen/sandbox.md) |
+| NG track limits & scoring detail | [norgesgruppen.md](norgesgruppen.md) |
+| Deadlines, tracks, submission | [competition/rules.md](competition/rules.md) |
+| Leaderboard snapshot & gaps | [competition/leaderboard.md](competition/leaderboard.md) |
+| Astar Island | [astar.md](astar.md) |
+| Repo layout, env | [repo.md](repo.md) |
+| Test-before-submit, `/nmai` workflow | [conventions/workflow.md](conventions/workflow.md) |
+| Recurring failures (append new) | [ERRORS.md](ERRORS.md) |
 
-## Conventions
+## Claude Code / Tripletex agent
 
-- **Domain** = what things are (APIs, schemas, scoring rules).
-- **Procedural** = how to run tests, submit, reproduce setups.
-- Log new failures in **ERRORS.md**; promote stable conclusions into the right category file and trim the log.
+- **Runtime truth:** `nmai2026/tripletex/agent.py` (`SYSTEM_PROMPT`, `execute_tool`, sanitizers).
+- **Handoff stub:** `nmai2026/tripletex/CLAUDE.md` → **INDEX** + **tripletex/api-quirks.md**.
+
+## Maintenance
+
+- Promote stable conclusions from **ERRORS.md** into the right topic file; trim the log.
+- Refresh **competition/leaderboard.md** and **`tripletex/data.json`** when the platform scoreboard changes.

@@ -1,5 +1,7 @@
 # NorgesGruppen — object detection (NM i AI 2026)
 
+**Structured shortcuts:** [`INDEX.md`](INDEX.md) → **`norgesgruppen/model.md`**, **`norgesgruppen/sandbox.md`**. This file remains the **full** track reference.
+
 Detect grocery products on store shelves. Upload **model code as a `.zip`**; it runs in a **sandboxed Docker** container on the organisers’ servers (**no network**).
 
 ## How it works

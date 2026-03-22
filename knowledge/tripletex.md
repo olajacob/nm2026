@@ -1,5 +1,7 @@
 # Tripletex track — domain & procedural
 
+> **Quick lookup:** structured cheatsheets live under **`knowledge/tripletex/`** — start from [`INDEX.md`](INDEX.md) → **api-quirks.md**, **task-registry.md**, **scoring.md**. This file is the **long-form** narrative.
+
 > **Note:** Some sessions say `TRIPLETEX.md`; on case-insensitive volumes that is the same path as this file.
 
 ## Domain

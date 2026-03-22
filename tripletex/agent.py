@@ -1728,7 +1728,7 @@ TRIPLETEX API KNOWLEDGE:
 
 COMMON TASK PATTERNS (memorize these to avoid extra calls):
 
-Invoice bank registration: use **MANDATORY SETUP BEFORE INVOICE TASKS** at the **top** — **`GET`** **`number=1920`** → **one** **`PUT`** **`bankAccountNumber`** only; **no** **`POST /ledger/account` 1921**; **no** duplicate **`bankAccountNumber`** across accounts; **no** random kontonummer guesses.
+Invoice bank: **MANDATORY SETUP BEFORE INVOICE TASKS** — **`GET`** **`number=1920`** → **one** **`PUT`** **`bankAccountNumber`**; **no** **1921** **POST**; **no** duplicate **`bankAccountNumber`**.
 
 Create department:
 POST /department {name: "..."}
@@ -1881,10 +1881,11 @@ CRITICAL **`paidAmount`** (customer invoice — **Task 11** pattern: **foreign c
 
 **CONCRETE EXAMPLE — Task 27 / Task 11 pattern (FCY narrative, invoice stored in NOK):**
 - **`GET /invoice/{id}`** returns: **`amountOutstanding` = 2238.75**, **`currency`** = **NOK**
-- Prompt says: invoice was **1791 EUR** at rate **11.03**, paid at rate **10.66**
-- **WRONG:** **`paidAmount` = 1791 × 10.66 = 19096 NOK** — **NEVER DO THIS**
-- **CORRECT:** **`paidAmount` = 2238.75** — **always** use **`amountOutstanding`** from the API (or **`amountCurrencyOutstanding`** when that is the NOK open amount)
-- **Reason:** Tripletex stores invoices in **company currency (NOK)**. The **EUR** amount and **exchange rates** in the prompt describe the **original** transaction — they **do not** change what you settle against the **open balance** on **`PUT …/:payment`**. **Only** use rate calculations if the task explicitly says **book currency gain/loss as a separate journal entry** — and **even then**, **`paidAmount`** on **`:payment`** stays **`amountOutstanding`** (the FX entry is **`tripletex_post_voucher`**, not a substitute **`paidAmount`**).
+- Prompt says: invoice was **1791 EUR** at rate **11.03**, paid at rate **10.66** (or any other rate in the text)
+- **WRONG:** **`paidAmount` = 1791 × 10.66 ≈ 19096 NOK** — **NEVER** (FCY × payment rate ≠ settlement)
+- **WRONG:** **`paidAmount` = 1791 × 10.29 ≈ 18428 NOK** — **NEVER** (same mistake, different rate — **always** read **`amountOutstanding`**)
+- **CORRECT:** **`paidAmount` = 2238.75** (copy **`amountOutstanding`** / **`amountCurrencyOutstanding`** from **`GET /invoice/{id}`**)
+- **Reason:** Open balance in **NOK** is authoritative; EUR/rates in the prompt are **context** for a **separate** valutagevinst/-tap **`tripletex_post_voucher`** only if asked — **never** bake that math into **`:payment`** **`paidAmount`**.
 
 Currency gain/loss journal (valutagevinst/-tap bilag):
 After **PUT** `/:payment`, if the task asks to book the FX difference:
@@ -1898,6 +1899,12 @@ After **PUT** `/:payment`, if the task asks to book the FX difference:
 
 **Partial** / **several bank lines** (unchanged): **`paidAmount`** = **actual** cash for **this** registration (CSV row or task) when **less** than outstanding; **one PUT per** bank line; **never** duplicate the same line or split **one** line into ex-VAT + VAT as two PUTs. If the list **GET** lacks outstanding and **`fields`** **400**s, derive incl. VAT only as fallback: e.g. **amountExcludingVat × 1.25** at **25%** VAT — **still** prefer **`GET /invoice/{id}`** outstanding when available.
 
+**High-gap tasks (same session — finish, don’t stop at GET):**
+- **11 / 27:** **`:payment`** **`paidAmount`** = API **open balance** only; **valutadifferanse** = **8060/8160** + **1500/2900** **`tripletex_post_voucher`** if the prompt asks — **not** 1920 lines.
+- **12 / 06 / 24:** **`tripletex_post_voucher`** — **Σ amountGross = 0**, **`freeAccountingDimension*`** when dimension task, **no** **1920**; trust tool retry order (one-step → no-query → singular **`posting`** → hybrid → shell).
+- **13 / 17 / 28:** unknown brief until **`task_id`**-tagged logs — **always** complete writes (**POST/PUT**), not **`end_turn`** after listing.
+- **14 / 18 (pattern that scores):** **travel** → **`POST /travelExpense/cost`** end-to-end; **timesheet+invoice** → **`POST /timesheet/entry`** → **1920** if **`:invoice`** → **product/order** → **`:invoice`** → **`:send`** (**EMAIL** / task) → verify success.
+
 Reverse payment / bank return (betaling returnert — **not** cancelling the sale):
 - Task says the **bank returned** the transfer, payment **bounced**, or to **undo / reverse the payment** so the **same invoice** shows **outstanding** again: **do not** use **`PUT /invoice/{id}/:createCreditNote`** — that creates a **credit note** (negates the **sale**), which is for **product returns / crediting the charge**, not a routine **failed inbound payment**.
 - **Do this instead:** **`GET /invoice/{invoiceId}?fields=id,invoiceNumber,postings`** (if **`postings`** looks incomplete, **`GET /invoice/{invoiceId}`** without a tight **`fields`** filter). Invoice **`postings`** include the **invoice line (positive)** and **payment line(s) (negative)**. Take **`voucher.id`** from the **payment** posting’s **`voucher`** (object or `{id}`).
@@ -1908,6 +1915,7 @@ Reverse payment / bank return (betaling returnert — **not** cancelling the sal
 Credit note (cancel / credit the **sale** — e.g. customer keeps goods and gets a credit, **not** a bounced bank transfer):
   tripletex_put_action: PUT /invoice/{id}/:createCreditNote (e.g. ?date=YYYY-MM-DD per Swagger)
 **Norwegian cues:** **kreditnota**, **reklamasjon** / **reklamert**, **fullstendig kreditnota**, **reverserer (hele) fakturaen** → **`GET /customer?organizationNumber=…`** then **`GET /invoice?customerId=…`** → pick **`id`** for the matching **beløp** / **faktura** → **`tripletex_put_action`** with path **`/invoice/{id}/:createCreditNote`** and **`params.date`**.
+**German cues (Gutschrift = credit the sale):** **Gutschrift**, **vollständige Gutschrift**, **Rechnung reklamiert** / **hat … reklamiert** (dispute over the **invoice / charge**, not a **bank** return), **die gesamte Rechnung stornieren** / **storniert** → same flow: **`GET /customer?organizationNumber=…`** → **`GET /invoice?customerId=…`** (match **amountExcludingVat** / **invoiceNumber** / description) → **`tripletex_put_action`** **`PUT /invoice/{id}/:createCreditNote`** with **`params.date`** (credit-note date — use task date or **today** **YYYY-MM-DD** if absent). **Do not** stop after **`GET /invoice`** — you must **`PUT …/:createCreditNote`**. **Not** **`:reverse`** unless the task is **only** **Zahlung zurück** / **Rückbuchung** (see **Reverse payment** above).
 **Portuguese / Spanish cues:** **nota de crédito** / **nota de credito**, **Emita** … **completa**, **reverta** / **reverte** … **fatura** / **factura**, **reclamou** / **reclamó** → same **`GET /customer?organizationNumber=…`** + **`GET /invoice?customerId=…`** (match **amountExcludingVat** / line text) → **`PUT /invoice/{id}/:createCreditNote`** — **not** **`:reverse`** on a **payment** voucher (that is for **bank return**, not crediting the **sale**).
 
 Create project:
@@ -1989,12 +1997,14 @@ When the task is to **book** a **purchase** from an **attached PDF receipt** on 
    - **Transport / reise / tog / fly / taxi** → **7140** (*Reisekostnader* / travel) or **6860**
    - **Hotell / overnatting** → **7160**
    - **Representasjon / mat** (business meal) → **7350**
+   - **USB / hub / PC / electronics / small hardware** (not travel) → **6540** (*Inventar*) — else **6800** (*Kontorrekvisita*) if the chart treats it as office supplies
    - **Kontorrekvisita** → **6800**
    - If **unsure**: **`GET /ledger/account?number=7140&fields=id,number,name`**, then **6860**, then **7100** — **first** hit whose **name** matches the receipt; **do not** scan the whole chart.
 3. **CRITICAL:** **Do not** use **6010** for **travel / tog / fly / taxi receipts** — in many charts **6010** is **avskrivning** (*depreciation*), **not** a ticket purchase.
-4. **Department:** **`GET /department?fields=id,name`** → **`id`** for the **named** avdeling (e.g. **Kvalitetskontroll**) → set **`department: {id}`** on postings when Swagger allows.
-5. **Post:** **`tripletex_post_voucher`** — **debit** the **expense** account (**`amountGross` > 0**), **credit** balancing line(s): **2740** (*skyldig MVA* / VAT payable) **or** another **non-bank** balance-sheet/clearing account per task — **never** **1920** / bank accounts on manual vouchers (**Create ledger voucher** **CRITICAL**). **All lines balance** (sum **`amountGross` = 0**). Use **`send_to_ledger: true`** when the task expects the voucher in the ledger. See **Create ledger voucher** below for **`amountGross`** signs and tool behaviour.
-6. **VAT:** for **domestic** Norway **25% inngående** on **transport**-style purchases, set **`vatType: {id: 1}`** on the **expense** posting when the **Posting** model supports **`vatType`** — if the tenant expects **split lines** (ex-VAT + VAT + bank), derive amounts from the receipt and **GET /ledger/vatType** once if needed (**fields=id,percentage,displayName**).
+4. **Department:** **`GET /department?fields=id,name`** → **`id`** for the **named** **Lager** / **Abteilung** / avdeling (e.g. **Kvalitetskontroll**) → set **`department: {id}`** on the **expense** line when Swagger allows.
+5. **Amounts (before post):** From the receipt, take **TTC** = total **inkl. MVA** / **gross** in **NOK** (øre → whole NOK). At **25% VAT:** **net = TTC / 1.25**, **VAT = TTC − net**. **Every `amountGross` on the voucher must sum to 0** — or Tripletex returns **422** *«Summen av posteringene … er ikke lik 0»*.
+6. **Post — incoming MVA (recommended):** **`tripletex_post_voucher`** with **three lines**: **(1)** **debit** expense **`amountGross` = **net**, **`department`** if set, **omit** **`vatType`**; **(2)** **debit** **2710** (*Inngående MVA*) **`GET /ledger/account?number=2710`** — **`amountGross` = VAT**; **(3)** **credit** **2740** (*Oppgjør MVA*) **`amountGross` = −TTC**. **Do not** combine **`vatType: {id: 1}`** on the expense line **with** a **hand-tuned** **2740** line unless the totals **still** sum to **0** (a common failure mode). If **one** gross line with **`vatType:1`** **422**s or imbalances, **switch** to this **net + 2710 + 2740** split. **DE/FR/EN receipt cues** (*Quittung*, *Ausgabe*, *reçu*, *receipt*) — same rule.
+7. **Never** **1920** / bank on manual voucher lines; **`send_to_ledger: true`** when the task expects ledger booking. See **Create ledger voucher** for signs and retries.
 
 **Do not** `end_turn` after only **GET**s — **`tripletex_post_voucher`** must run when the user asked to **bokfør** from the receipt.
 

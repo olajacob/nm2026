@@ -1,19 +1,19 @@
 {
-  "updated": "2026-03-22 (scoreboard sync #17)",
+  "updated": "2026-03-22 (final sprint notes + task-registry + total_teams 401)",
   "team_name": "Kongsberg Development Agent",
   "team_flag": "🇳🇴",
   "tasks_solved": "30/30",
   "leaderboard": {
-    "rank": 99,
-    "total_teams": 376,
-    "score": 59.34,
-    "tripletex": 20.6,
-    "norgesgruppen": 14.2,
+    "rank": 128,
+    "total_teams": 401,
+    "score": 58.75,
+    "tripletex": 20.3,
+    "norgesgruppen": 14.0,
     "astar": 24.5
   },
-  "runs_today": 181,
+  "runs_today": 206,
   "last_run_task": "25",
-  "last_run_note": "Scoreboard sync #17: rank 99, total 59.34 (NG 14.2, TT 20.6, Astar 24.5), 181 submissions. Try deltas vs #16: 07→8, 08→6, 10→6, 23→6.",
+  "last_run_note": "Final sprint 2026-03-22: rank 128/401 est., total 58.75. Tripletex priorities 11/12 (null), 13/17 (partial), 22; FCY paidAmount example tightened in agent.py; set task_id on every submit. SYSTEM_PROMPT ~18k tok est. — large trim deferred (risk).",
   "deadline": "2026-03-22 15:00",
   "repo": "github.com/olajacob/nm2026",
   "license": "MIT",
@@ -23,31 +23,31 @@
     {"id": "03", "score": 2.00, "tries": 6},
     {"id": "04", "score": 2.00, "tries": 8},
     {"id": "05", "score": 1.33, "tries": 6},
-    {"id": "06", "score": 1.40, "tries": 7},
+    {"id": "06", "score": 1.20, "tries": 7},
     {"id": "07", "score": 2.00, "tries": 8},
-    {"id": "08", "score": 2.00, "tries": 6},
-    {"id": "09", "score": 2.67, "tries": 5},
+    {"id": "08", "score": 2.00, "tries": 8},
+    {"id": "09", "score": 2.67, "tries": 7},
     {"id": "10", "score": 2.50, "tries": 6},
-    {"id": "11", "score": null, "tries": 7},
-    {"id": "12", "score": null, "tries": 7},
-    {"id": "13", "score": 0.50, "tries": 5},
-    {"id": "14", "score": 4.00, "tries": 8},
-    {"id": "15", "score": 2.80, "tries": 7},
-    {"id": "16", "score": 2.80, "tries": 6},
-    {"id": "17", "score": 1.38, "tries": 8},
-    {"id": "18", "score": 4.00, "tries": 4},
-    {"id": "19", "score": 2.05, "tries": 6},
-    {"id": "20", "score": 0.60, "tries": 4},
-    {"id": "21", "score": 2.14, "tries": 6},
-    {"id": "22", "score": null, "tries": 4},
+    {"id": "11", "score": null, "tries": 8},
+    {"id": "12", "score": null, "tries": 8},
+    {"id": "13", "score": 0.50, "tries": 6},
+    {"id": "14", "score": 4.00, "tries": 10},
+    {"id": "15", "score": 2.80, "tries": 9},
+    {"id": "16", "score": 2.40, "tries": 7},
+    {"id": "17", "score": 1.38, "tries": 9},
+    {"id": "18", "score": 4.00, "tries": 6},
+    {"id": "19", "score": 2.05, "tries": 7},
+    {"id": "20", "score": 0.60, "tries": 5},
+    {"id": "21", "score": 2.14, "tries": 8},
+    {"id": "22", "score": null, "tries": 5},
     {"id": "23", "score": 0.60, "tries": 6},
     {"id": "24", "score": 2.25, "tries": 4},
     {"id": "25", "score": 4.29, "tries": 5},
     {"id": "26", "score": 3.50, "tries": 5},
-    {"id": "27", "score": 5.00, "tries": 6},
+    {"id": "27", "score": 5.00, "tries": 7},
     {"id": "28", "score": 0.60, "tries": 5},
-    {"id": "29", "score": 1.64, "tries": 6},
-    {"id": "30", "score": 1.80, "tries": 5}
+    {"id": "29", "score": 1.64, "tries": 7},
+    {"id": "30", "score": 1.80, "tries": 8}
   ],
   "task_registry": {
     "01": {"description": "Create employee", "pattern": "GET /employee?email= → POST /employee"},
@@ -84,6 +84,13 @@
     "30": {"description": "Annual closing / depreciation / tax", "pattern": "tripletex_post_voucher — 12xx per prompt; lease 6xxx; tax 8300"}
   },
   "backlog": [
+    {
+      "id": "sprint1",
+      "status": "next",
+      "title": "Final sprint: Tripletex 11/12/13/17 + task_id",
+      "detail": "Submit with task_id; 11/27 paidAmount=amountOutstanding; 12 bilag balance+dimension; 13/17 complete writes. test_sandbox --local-only green. NG: submission_ng_m when weights ready.",
+      "affects": ["11", "12", "13", "17", "22"]
+    },
     {
       "id": "next3",
       "status": "next",
@@ -275,9 +282,10 @@
     }
   ],
   "notes": [
-    "Rank #99 / 376 — Kongsberg Development Agent 🇳🇴 — 30/30 Tripletex tasks — total 59.34 (TT 20.6, NG 14.2, Astar 24.5)",
-    "181 submissions (runs_today). Sync logs via `task_id` / `X-Task-Id` + `logs/last_solve.log`.",
-    "3 null-score tasks: 11, 12, 22. Task 07→2.00 (8 tries), 08→2.00 (6), 10→2.50 (6), 23→0.60 (6). Task 15→2.80 (7). Task 24→2.25 (4). Task 01→1.50 (9). Task 04→2.00 (8). Task 11→— (7). Task 12→— (7). Task 14→4.00 (8). Task 28→0.60 (5). Task 16→2.80 (6). Task 18→4.00 (4). Task 20→0.60 (4). Task 17→1.38 (8). Task 29→1.64 (6). Task 27→5.00 (6) | Task 25 4.29.",
-    "Deadline 22. mars 2026 15:00 CET"
+    "Rank #128 / ~401 teams — Kongsberg Development Agent 🇳🇴 — total 58.75 (TT 20.3, NG 14.0, Astar 24.5) — verify on platform.",
+    "COUNTDOWN: deadline 22. mars 2026 15:00 CET — remaining Tripletex submits ~3–4/task, NG ~2; use task_id every time.",
+    "agent.py: extra WRONG paidAmount line (1791×10.29); sprint bullet block 11/12/13/17/14/18; tiny trim duplicate invoice-bank sentence.",
+    "Null-score focus: 11, 12, 22. Partial: 13, 17, 28. Strong refs: 14/18/25/27. SYSTEM_PROMPT ~72k chars (~18k tok est.) — pass-2 trim optional post-deadline.",
+    "Checklist: python3 test_sandbox.py --local-only; restart server; ngrok + skip-browser-warning; target tasks 11,12,13,17."
   ]
 }

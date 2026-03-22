@@ -19,7 +19,6 @@
 ---
 
 ## Quick commands
-/nmai = Analyser tripletex/logs/last_solve.log (siste run), 
-implementer forbedringer i tripletex/agent.py, 
-test med python3 tripletex/test_sandbox.py,
-oppdater dashboard/data.json med funn.
+/nmai = Les `knowledge/INDEX.md` ved behov; analyser `tripletex/logs/last_solve.log` (siste run),
+implementer i `tripletex/agent.py`, test `python3 tripletex/test_sandbox.py --local-only`,
+oppdater `tripletex/data.json` ved eksplisitt scoreboard-/backlog-sync.

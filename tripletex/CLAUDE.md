@@ -1,91 +1,33 @@
-# Tripletex-agent — handoff for assistenter (Claude m.fl.)
+# Tripletex agent — Claude Code handoff
 
-Dette dokumentet utdyper **`SYSTEM_PROMPT`** i `agent.py` for **leverandørfaktura** (`POST /supplierInvoice`) og relaterte API-er. **Sannhetskilde for agent-atferd er fortsatt `agent.py`** — oppdater begge steder hvis du endrer flyt.
+**Sannhetskilde for oppførsel:** `agent.py` (`SYSTEM_PROMPT`, `execute_tool`, sanitizers, voucher-routing).  
+**Strukturert minne (last kun det du trenger):** [`../knowledge/INDEX.md`](../knowledge/INDEX.md)
 
----
-
-## 1. Hvorfor denne guiden finnes
-
-### Observert problem
-
-- **`POST /supplierInvoice`** med kun  
-  `invoiceNumber`, `invoiceDate`, `supplier: { id }`  
-  ga i live-test **HTTP 500** med Tripletex **code 1000** og ofte **tom `message`**.
-- Det oppfører seg som **manglende påkrevd data** / server-side feilhåndtering, ikke en ren **422** med feltnavn.
-
-### Konklusjon i prompten
-
-- **Første vellykkede forsøk** bør inkludere **`amountCurrency`** (totalt **inkl. MVA**) og **`currency`** (typisk NOK → **`{ "id": 1 }`**).
-- **Hvis fortsatt 500:** **én retry** med samme body **pluss** **`invoiceDueDate`**.
+| Trenger du … | Åpne |
+|--------------|------|
+| API-422, supplierInvoice 500, GET-fields, voucher-MVA | [`../knowledge/tripletex/api-quirks.md`](../knowledge/tripletex/api-quirks.md) |
+| Oppgaver 01–30 / mønstre | [`../knowledge/tripletex/task-registry.md`](../knowledge/tripletex/task-registry.md) |
+| Effektivitet / proxy / logging | [`../knowledge/tripletex/scoring.md`](../knowledge/tripletex/scoring.md) |
+| Lange flyter (bank CSV, ordre→faktura) | [`../knowledge/tripletex.md`](../knowledge/tripletex.md) |
+| Gjentatte feil | [`../knowledge/ERRORS.md`](../knowledge/ERRORS.md) |
 
 ---
 
-## 2. Primær flyt: registrer mottatt leverandørfaktura
+## Kritiske konvensjoner
 
-| Steg | Handling |
-|------|----------|
-| A | **Leverandør:** `GET /customer` (f.eks. `organizationNumber`) med `fields` som inkluderer **`isCustomer`** → ev. **`POST /customer`** med `isSupplier: true`, `isCustomer: false`, + navn/orgnr/e-post fra oppgaven. |
-| A′ | **Tenant-quirk:** Etter **`POST`** (eller hvis liste-GET viser `isCustomer: true`): **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** → ved behov **`PUT /customer/{id}`** `{"isCustomer": false}` → valgfritt **nytt `GET`** for å verifisere (viktig for graders). Stol ikke på **`POST`**-respons alene. |
-| B | **Kostnadskonto:** **Én** `GET /ledger/account?number=NNNN` for oppgitt konto (f.eks. 7300) — til **oppfølging** etter faktura er opprettet; ikke masse-GET av kontoer. |
-| C | **`POST /supplierInvoice`** med standard body (se §3). |
-| D | Oppgave krever godkjenning: **`PUT /supplierInvoice/{id}/:approve`** via **`tripletex_put_action`** (ikke `:book` i standard v2). |
-
-**Aldri** `end_turn` etter bare leverandør + ledger-GET uten å ha kjørt **`POST /supplierInvoice`** (og evt. **`:approve`**).
-
-**Ikke** bruk **`tripletex_post_voucher`** / manuell **`/ledger/voucher`** for denne flyten med mindre oppgaven eksplisitt krever det eller API-et ikke tilbyr `/supplierInvoice`.
+1. **Endringer i flyt** → oppdater **`agent.py`** først; deretter ev. **`knowledge/tripletex/api-quirks.md`** (kort sannhet) og **`tripletex.md`** (narrativ).
+2. **`POST /supplierInvoice`:** NM-sandbox returnerer ofte **HTTP 500 / code 1000** — se **api-quirks.md** for kanonisk body, én retry med **`invoiceDueDate`**, og **voucher-fallback** (ingen duplikat-POST samme faktura+leverandør). **A′** leverandør: **`isCustomer`**-quirk → **GET/PUT** etter **`POST /customer`**.
+3. **`tripletex_post_voucher`:** aldri **bankkonto (1920 …)** på linjer (med mindre sandbox-env); balanse **Σ amountGross = 0**; inngående MVA: foretrekk **netto + 2710 + 2740 −TTC** når **vatType + 2740** gir **422**.
+4. **Faktura liste:** **`invoiceDateFrom`/`To`** alltid; **`invoiceDueDate`** i **`fields`**, ikke **`dueDate`**.
+5. **Innbetaling:** **`paidAmount`** fra **`GET /invoice/{id}`** **`amountOutstanding`** — ikke ren **FCY×kurs** fra tekst.
+6. **Test:** `cd tripletex && python3 test_sandbox.py --local-only` etter endringer i agenten.
+7. **`task_id`** på **`POST /solve`** for sporbar **`logs/last_solve.log`** og grader-korrelasjon.
 
 ---
 
-## 3. Kanonisk body for `POST /supplierInvoice`
+## Server / løsning
 
-```json
-{
-  "invoiceNumber": "INV-…",
-  "invoiceDate": "YYYY-MM-DD",
-  "supplier": { "id": "<supplier_id>" },
-  "amountCurrency": "<beløp_inkl_MVA>",
-  "currency": { "id": 1 }
-}
-```
+- **`server.py`**: **`POST /solve`**, valfritt **`API_KEY`**, logger til **`logs/last_solve.log`** + arkiv.
+- **`data.json`**: lag snapshot av leaderboard/tasks når bruker ber om sync (ikke hver agentendring).
 
-- **`amountCurrency`:** Bruk beløpet oppgaven gir som **TTC / inkl. MVA / «inklusive»** — mapp til **én** totalsum i selskapets valuta.
-- **`currency.id: 1`:** Forventet **NOK** i typisk norsk tenant; ved annen valuta må `id` avklares (OpenAPI / `GET /currency`).
-
-### Ved fortsatt HTTP 500
-
-1. **Retry én gang** med **samme felter** **pluss**  
-   `"invoiceDueDate": "YYYY-MM-DD"`  
-   (hvis oppgaven ikke sier forfall: f.eks. **14 dager etter** `invoiceDate` som heuristikk).
-
-### Felter å **unngå** i første omgang (kjente 422 / støy)
-
-- **`comment`** på create-body (felt eksisterer ikke / avvist).
-- **`account`** på **`orderLines[]`**, og **`orderLines`** som inkluderer **`account`**.
-
-*Merk:* Dette er **ikke** det samme som «aldri `orderLines`» — kun at **problemvarianten med `account` på linjer** er utelukket i prompten.
-
----
-
-## 4. Andre `supplierInvoice`-endepunkter (kontekst)
-
-| Behov | Verktøy / metode |
-|-------|------------------|
-| Liste fakturaer | **`GET /supplierInvoice`** krever **`invoiceDateFrom`** og **`invoiceDateTo`** (samme mønster som **`GET /invoice`**). |
-| Godkjenning | **`PUT /supplierInvoice/{id}/:approve`** (`tripletex_put_action`). |
-| Registrer betaling | **`POST /supplierInvoice/{id}/:addPayment`** med body **`{}`** og **query-params** per OpenAPI (`tripletex_post`) — se `SYSTEM_PROMPT` punkt om utbetalinger/CSV. |
-
----
-
-## 5. Relasjon til `agent.py`
-
-- Seksjonen **«Register supplier invoice»** i **`SYSTEM_PROMPT`** speiler §2–3 over.
-- **`tripletex_post`**-beskrivelsen nevner eksplisitt **`invoiceNumber`**, **`invoiceDate`**, **`supplier`**, **`amountCurrency`**, **`currency`** for `/supplierInvoice`.
-
-Ved endringer: **oppdater `agent.py` og dette dokumentet** så assistenter som leser repo-filer får samme bilde.
-
----
-
-## 6. Begrensninger
-
-- **Code 1000** med tom melding er **vanskelig å feilsøke** uten tenant-spesifikk logging; retry med **`invoiceDueDate`** er en **heuristikk**.
-- Multivaluta-oppgaver kan kreve annet enn **`currency: {id: 1}`** — valider mot oppgave og API.
+Detaljert leverandørfaktura-tabell, JSON-eksempler og punktliste som tidligere lå her finnes nå i **`knowledge/tripletex/api-quirks.md`** (kompakt) og **`knowledge/tripletex.md`** (utfyllende).

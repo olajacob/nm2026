@@ -3237,9 +3237,20 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                     _agent_print(
                         f"  ℹ️  HTTP 403 on {name} — often expired proxy token (infra). Model should continue remaining planned calls."
                     )
+            elif status == 401:
+                _agent_print(
+                    f"  ℹ️  HTTP 401 on {name} — **Unauthorized**; **session_token** / Basic auth invalid or expired "
+                    "(paste fresh token from NM platform for this submission)."
+                )
             else:
                 _agent_print(f"  ⚠️  4xx ERROR ({status}) on {name} — costs efficiency bonus!")
         err_payload: dict[str, Any] = {"http_error": status, "details": detail}
+        if status == 401:
+            err_payload["_toolNote"] = (
+                "**HTTP 401 Unauthorized:** `TRIPLETEX_SESSION_TOKEN` (Basic password, user **0**) is **missing, wrong, or expired**. "
+                "Copy the **session token** from the **current** NM i AI submission into the agent (env / `POST /solve` body) and **retry** — "
+                "**do not** `end_turn` as successfully completed or invent **customer**/**ledger** **id**s from failed calls."
+            )
         if status == 403 and _nmiai_proxy_expired_token_detail(detail):
             err_payload["_toolNote"] = (
                 "**nmiai-proxy:** the **session_token** for **this submission** is invalid or expired — Tripletex will not "

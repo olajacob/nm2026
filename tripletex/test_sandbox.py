@@ -57,10 +57,16 @@ from agent import (
     TripletexCredentials,
     _apply_invoice_payment_paid_amount_guard,
     _apply_tripletex_get_sanitizers,
+    _employment_division_put_rejected,
+    _employment_division_post_ids,
     _employment_post_attempt_sequence,
+    _enrich_travel_expense_post_body,
+    _salary_transaction_422_tool_note,
+    _reset_per_solve_guards,
     _get_params_cache_key,
     _ledger_account_3400_fee_credit_quirk_note,
     _merge_customer_into_positive_posting_lines,
+    _nmiai_proxy_expired_token_detail,
     _normalize_voucher_posting_line,
     _reject_manual_voucher_bank_lines,
     _pdf_employee_context_hint,
@@ -118,6 +124,70 @@ def run_agent_unit_tests() -> int:
     err = 0
     dead = _ApiMustNotGet()
 
+    if not _nmiai_proxy_expired_token_detail('{"source":"nmiai-proxy","error":"Invalid or expired"}'):
+        _fail("nmiai proxy detail helper: expected True for proxy JSON")
+        err += 1
+    elif not _nmiai_proxy_expired_token_detail("invalid or expired proxy token"):
+        _fail("nmiai proxy detail helper: expected True for plain message")
+        err += 1
+    elif _nmiai_proxy_expired_token_detail(""):
+        _fail("nmiai proxy detail helper: expected False for empty")
+        err += 1
+    else:
+        _ok("_nmiai_proxy_expired_token_detail (local)")
+
+    try:
+        _b_te = _enrich_travel_expense_post_body(
+            {
+                "employee": {"id": 1},
+                "paymentType": {"id": 99},
+                "type": "TRAVEL",
+                "travelDetails": {"purpose": "x"},
+            }
+        )
+        if "paymentType" in _b_te or _b_te.get("type") != 0:
+            _fail(f"travel expense POST enrich: expected paymentType stripped + type 0, got {_b_te!r}")
+            err += 1
+        else:
+            _ok("POST /travelExpense enrich: strip paymentType, TRAVEL→0 (local)")
+    except Exception as e:
+        _fail(f"travel expense POST enrich: {e}")
+        err += 1
+
+    _sn = _salary_transaction_422_tool_note(
+        422,
+        '{"validationMessages":[{"message":"Ugyldig år."}]}',
+        "tripletex_post",
+        {"path": "/salary/transaction"},
+    )
+    if not _sn or "2026" not in _sn:
+        _fail(f"salary 422 tool note (Ugyldig år): expected 2026 hint, got {_sn!r}")
+        err += 1
+    else:
+        _ok("salary 422 _toolNote: Ugyldig år (local)")
+
+    class _ApiNoDelete:
+        supplier_invoice_500_seen: set[str] = set()
+
+        def delete(self, *_a, **_k) -> dict:
+            raise AssertionError("DELETE employment should be skipped")
+
+    try:
+        _del_out = execute_tool(
+            "tripletex_delete",
+            {"path": "/employee/employment/12345"},
+            _ApiNoDelete(),  # type: ignore[arg-type]
+        )
+        _dd = json.loads(_del_out)
+        if not _dd.get("skipped"):
+            _fail(f"DELETE employment guard: expected skipped, got {_del_out[:200]!r}")
+            err += 1
+        else:
+            _ok("tripletex_delete /employee/employment/{id} — no HTTP (local)")
+    except Exception as e:
+        _fail(f"DELETE employment guard: {e}")
+        err += 1
+
     for label, params in (
         ("empty string", {"email": ""}),
         ("whitespace only", {"email": "  \t  "}),
@@ -141,6 +211,40 @@ def run_agent_unit_tests() -> int:
         except Exception as e:
             _fail(f"employee empty-email guard ({label}): {e}")
             err += 1
+
+    class _ApiNoPostEmployee:
+        supplier_invoice_500_seen: set[str] = set()
+
+        def get(self, *_a, **_k) -> dict:
+            raise AssertionError("GET unexpected in POST /employee guard test")
+
+        def post(self, *_a, **_k) -> dict:
+            raise AssertionError("POST /employee guard should not call api.post")
+
+    try:
+        out_pe = execute_tool(
+            "tripletex_post",
+            {
+                "path": "/employee",
+                "body": {
+                    "firstName": "X",
+                    "lastName": "Y",
+                    "userType": "STANDARD",
+                    "department": {"id": 1},
+                    "dateOfBirth": "1990-01-01",
+                },
+            },
+            _ApiNoPostEmployee(),  # type: ignore[arg-type]
+        )
+        dpe = json.loads(out_pe)
+        if not isinstance(dpe.get("error"), str) or "email" not in dpe["error"].lower():
+            _fail(f"POST /employee without email: expected error mentioning email, got {out_pe[:320]!r}")
+            err += 1
+        else:
+            _ok("execute_tool POST /employee without email — no HTTP (local)")
+    except Exception as e:
+        _fail(f"POST /employee email guard: {e}")
+        err += 1
 
     pdf = FileAttachment(filename="x.pdf", content_base64="e30=", mime_type="application/pdf")
     if _pdf_employee_context_hint([], "Registrer ny ansatt") is not None:
@@ -168,6 +272,16 @@ def run_agent_unit_tests() -> int:
         err += 1
     else:
         _ok("PDF hint: embauche/salaire → hint text")
+
+    h_intacc = _pdf_employee_context_hint(
+        [pdf],
+        "Vous avez reçu une lettre d'offre (voir PDF). Effectuez l'intégration complète.",
+    )
+    if not h_intacc or "e-post" not in h_intacc:
+        _fail(f"PDF hint: expected FR intégration/lettre/offre prompt → hint, got {h_intacc!r}")
+        err += 1
+    else:
+        _ok("PDF hint: FR lettre d'offre + intégration (accented) → hint text")
 
     class _PostSupplierInv500:
         def __init__(self) -> None:
@@ -239,6 +353,119 @@ def run_agent_unit_tests() -> int:
     else:
         _ok("PDF supplier hint: Portuguese fornecedor+fatura → text")
 
+    h_fr_sup = _pdf_supplier_invoice_context_hint(
+        [pdf],
+        "Vous avez recu une facture fournisseur (voir PDF). Enregistrez la facture. Creez le fournisseur.",
+    )
+    if not h_fr_sup or "tripletex_post_voucher" not in h_fr_sup:
+        _fail(f"PDF supplier hint FR: expected voucher mention, got {h_fr_sup!r}")
+        err += 1
+    else:
+        _ok("PDF supplier hint: French facture+fournisseur+enregistrer → text")
+
+    class _PostForbidden:
+        def post(self, *_a, **_k) -> None:
+            raise AssertionError("HTTP post should not run for this guard test")
+
+    try:
+        o_guard_act = execute_tool(
+            "tripletex_post",
+            {"path": "/activity", "body": {"name": "X", "description": "Y"}},
+            _PostForbidden(),  # type: ignore[arg-type]
+        )
+        dga = json.loads(o_guard_act)
+        if not isinstance(dga.get("error"), str) or "activitytype" not in dga["error"].lower():
+            _fail(f"POST /activity guard: expected error about activityType, got {o_guard_act[:300]!r}")
+            err += 1
+        else:
+            _ok("execute_tool POST /activity without activityType — no HTTP (local)")
+    except Exception as e:
+        _fail(f"POST /activity guard: {e}")
+        err += 1
+
+    class _PostCaptureActivity:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def post(self, path: Any, body: Any, params: Any = None) -> dict[str, Any]:
+            self.calls.append((path, body))
+            return {"value": {"id": 999}}
+
+    try:
+        cap_act = _PostCaptureActivity()
+        o_at_str = execute_tool(
+            "tripletex_post",
+            {
+                "path": "/activity",
+                "body": {"name": "X", "activityType": "PROJECT_GENERAL_ACTIVITY"},
+            },
+            cap_act,  # type: ignore[arg-type]
+        )
+        d_at = json.loads(o_at_str)
+        if len(cap_act.calls) != 1:
+            _fail(
+                f"POST /activity string activityType: expected 1 post, got {len(cap_act.calls)}"
+            )
+            err += 1
+        elif d_at.get("value", {}).get("id") != 999:
+            _fail(f"POST /activity string activityType: bad response {o_at_str[:250]!r}")
+            err += 1
+        else:
+            _ok("execute_tool POST /activity with string activityType passes guard (local)")
+    except Exception as e:
+        _fail(f"POST /activity string activityType: {e}")
+        err += 1
+
+    try:
+        o_guard_pr = execute_tool(
+            "tripletex_post",
+            {
+                "path": "/project",
+                "body": {
+                    "name": "P",
+                    "customer": {"id": 1},
+                    "startDate": "2026-03-01",
+                },
+            },
+            _PostForbidden(),  # type: ignore[arg-type]
+        )
+        dgp = json.loads(o_guard_pr)
+        if not isinstance(dgp.get("error"), str) or "projectmanager" not in dgp["error"].lower():
+            _fail(f"POST /project guard: expected error about projectManager, got {o_guard_pr[:300]!r}")
+            err += 1
+        else:
+            _ok("execute_tool POST /project without projectManager — no HTTP (local)")
+    except Exception as e:
+        _fail(f"POST /project guard: {e}")
+        err += 1
+
+    try:
+        o_guard_ts = execute_tool(
+            "tripletex_post",
+            {
+                "path": "/timesheet/entry",
+                "body": {
+                    "project": {"id": 1},
+                    "activity": {"id": 1},
+                    "employee": {"id": 1},
+                    "date": "2026-03-01",
+                    "hours": 33,
+                },
+            },
+            _PostForbidden(),  # type: ignore[arg-type]
+        )
+        dts = json.loads(o_guard_ts)
+        if not isinstance(dts.get("error"), str) or "24" not in dts["error"]:
+            _fail(
+                f"POST /timesheet/entry hours guard: expected error about ≤24, got {o_guard_ts[:300]!r}"
+            )
+            err += 1
+        else:
+            _ok("execute_tool POST /timesheet/entry hours > 24 — no HTTP (local)")
+    except Exception as e:
+        _fail(f"POST /timesheet/entry hours guard: {e}")
+        err += 1
+
     try:
         sp, notes = _apply_tripletex_get_sanitizers(
             "/invoice/999001",
@@ -289,31 +516,51 @@ def run_agent_unit_tests() -> int:
             {"from": 0, "count": 50, "fields": "id,name,activityNumber,isInactive"},
         )
         fs = sp.get("fields", "")
-        if "isInactive" in fs:
-            _fail(f"activity fields sanitizer: expected isInactive stripped, got {fs!r}")
+        if "isInactive" in fs or "activityNumber" in fs:
+            _fail(f"activity fields sanitizer: expected isInactive+activityNumber stripped, got {fs!r}")
             err += 1
         elif "id" not in fs or "name" not in fs:
             _fail(f"activity fields sanitizer: expected id+name kept, got {fs!r}")
             err += 1
-        elif not notes or "isInactive" not in notes[0]:
-            _fail(f"activity sanitizer: expected note mentioning isInactive, got {notes!r}")
+        elif not notes or ("isInactive" not in notes[0] and "activityNumber" not in notes[0]):
+            _fail(f"activity sanitizer: expected note mentioning strip, got {notes!r}")
             err += 1
         else:
-            _ok("GET /activity fields: strips isInactive (local)")
+            _ok("GET /activity fields: strips isInactive + activityNumber (local)")
         sp2, n2 = _apply_tripletex_get_sanitizers(
             "/activity/12",
-            {"fields": "id,name,isInactive"},
+            {"fields": "id,name,activityNumber,isInactive"},
         )
-        if "isInactive" in (sp2.get("fields") or ""):
-            _fail(f"activity/{id} fields sanitizer: expected isInactive stripped, got {sp2.get('fields')!r}")
+        fs2 = sp2.get("fields") or ""
+        if "isInactive" in fs2 or "activityNumber" in fs2:
+            _fail(f"activity/{id} fields sanitizer: expected banned fields stripped, got {fs2!r}")
             err += 1
         elif not n2:
             _fail(f"activity detail sanitizer: expected note, got {n2!r}")
             err += 1
         else:
-            _ok("GET /activity/{id} fields: strips isInactive (local)")
+            _ok("GET /activity/{id} fields: strips isInactive + activityNumber (local)")
     except Exception as e:
         _fail(f"activity fields sanitizer: {e}")
+        err += 1
+
+    try:
+        sp_v, notes_v = _apply_tripletex_get_sanitizers(
+            "/ledger/voucher",
+            {"dateFrom": "2026-03-01", "dateTo": "2026-03-32", "fields": "id,date"},
+        )
+        if sp_v.get("dateTo") != "2026-03-31":
+            _fail(
+                f"ledger/voucher date clamp: expected dateTo 2026-03-31, got {sp_v.get('dateTo')!r}"
+            )
+            err += 1
+        elif not notes_v or "clamped" not in notes_v[0].lower():
+            _fail(f"ledger/voucher date clamp: expected note, got {notes_v!r}")
+            err += 1
+        else:
+            _ok("GET /ledger/voucher: clamps invalid dateTo (e.g. März 32 → 31) (local)")
+    except Exception as e:
+        _fail(f"ledger/voucher date sanitizer: {e}")
         err += 1
 
     try:
@@ -410,19 +657,23 @@ def run_agent_unit_tests() -> int:
     try:
         minimal = {"employee": {"id": 42}, "startDate": "2026-12-01"}
         seq = _employment_post_attempt_sequence(minimal)
-        if len(seq) != 4:
-            _fail(f"employment sequence: expected 4 bodies (div 1,2,3 + minimal), got {len(seq)}")
-            err += 1
-        elif (
-            seq[0].get("division") != {"id": 1}
-            or seq[1].get("division") != {"id": 2}
-            or seq[2].get("division") != {"id": 3}
-            or seq[3] != minimal
-        ):
-            _fail(f"employment sequence: unexpected bodies {seq!r}")
+        _n = len(_employment_division_post_ids())
+        if len(seq) != _n + 1:
+            _fail(
+                f"employment sequence: expected {_n + 1} bodies ({_n} division tries + minimal), got {len(seq)}"
+            )
             err += 1
         else:
-            _ok("employment POST sequence: division 1→2→3 then minimal (local)")
+            bad = False
+            for i, div_id in enumerate(_employment_division_post_ids()):
+                if seq[i].get("division") != {"id": div_id}:
+                    bad = True
+                    break
+            if bad or seq[_n] != minimal:
+                _fail(f"employment sequence: unexpected bodies {seq!r}")
+                err += 1
+            else:
+                _ok(f"employment POST sequence: division 1..{_n} then minimal (local)")
         seq_one = _employment_post_attempt_sequence(
             {"employee": {"id": 1}, "startDate": "2026-01-01", "division": {"id": 9}}
         )
@@ -431,8 +682,107 @@ def run_agent_unit_tests() -> int:
             err += 1
         else:
             _ok("employment POST sequence: body with division → single attempt (local)")
+        seq_url = _employment_post_attempt_sequence(
+            {
+                "employee": {"id": 7, "url": "https://example.invalid/employee/7"},
+                "startDate": "2026-02-01",
+            }
+        )
+        if len(seq_url) != _n + 1:
+            _fail(
+                f"employment sequence w/ employee.url: expected {_n + 1} bodies, got {len(seq_url)}"
+            )
+            err += 1
+        elif seq_url[0].get("employee") != {"id": 7} or seq_url[0].get("division") != {"id": 1}:
+            _fail(f"employment sequence w/ employee.url: bad first body {seq_url[0]!r}")
+            err += 1
+        elif seq_url[-1] != {"employee": {"id": 7}, "startDate": "2026-02-01"}:
+            _fail(f"employment sequence w/ employee.url: bad minimal tail {seq_url[-1]!r}")
+            err += 1
+        else:
+            _ok("employment POST sequence: employee {id,url} → normalised division sweep (local)")
     except Exception as e:
         _fail(f"employment sequence test: {e}")
+        err += 1
+
+    try:
+
+        class _PutShouldNotRun:
+            def put(self, path: str, body: dict) -> dict:
+                raise RuntimeError("PUT should be skipped when division 1+2 already 422")
+
+        _reset_per_solve_guards()
+        _eid_skip = 9_001_002
+        _employment_division_put_rejected[_eid_skip] = {1, 2}
+        _out_skip = execute_tool(
+            "tripletex_put",
+            {"path": f"/employee/employment/{_eid_skip}", "body": {"division": {"id": 3}}},
+            _PutShouldNotRun(),  # type: ignore[arg-type]
+        )
+        _data_skip = json.loads(_out_skip)
+        if not _data_skip.get("skipped"):
+            _fail(f"employment PUT division skip: expected skipped, got {_data_skip!r}")
+            err += 1
+        elif _data_skip.get("divisionIdSkipped") != 3:
+            _fail(f"employment PUT division skip: expected divisionIdSkipped 3, got {_data_skip!r}")
+            err += 1
+        else:
+            _ok("employment PUT division: skip HTTP for id 3 when 1+2 rejected (local)")
+        _reset_per_solve_guards()
+    except Exception as e:
+        _fail(f"employment PUT division skip test: {e}")
+        err += 1
+
+    try:
+
+        class _EmpSweepMinimalApi:
+            """404 on POST with division; 200 on minimal — mirrors tenants where PUT division always 422."""
+
+            def __init__(self) -> None:
+                self.employment_post_minimal_fallback_ids: set[int] = set()
+
+            def post(self, path: str, body: Any, params: Any = None) -> dict[str, Any]:
+                if "/employee/employment" in (path or "") and "/details" not in (path or ""):
+                    if isinstance(body, dict) and body.get("division"):
+                        e = requests.HTTPError()
+                        e.response = type("R", (), {"status_code": 404, "text": ""})()
+                        raise e
+                    return {"value": {"id": 884_402}}
+                raise AssertionError(f"unexpected post {path!r}")
+
+            def put(self, path: str, body: dict) -> dict:
+                raise RuntimeError("PUT should be skipped for minimal-fallback employment")
+
+        _es = _EmpSweepMinimalApi()
+        _sweep_post = execute_tool(
+            "tripletex_post",
+            {
+                "path": "/employee/employment",
+                "body": {"employee": {"id": 1}, "startDate": "2026-05-01"},
+            },
+            _es,  # type: ignore[arg-type]
+        )
+        _d_sp = json.loads(_sweep_post)
+        if _d_sp.get("value", {}).get("id") != 884_402:
+            _fail(f"employment sweep POST: bad value {_sweep_post[:200]!r}")
+            err += 1
+        elif 884_402 not in _es.employment_post_minimal_fallback_ids:
+            _fail("employment sweep POST: expected employment id in employment_post_minimal_fallback_ids")
+            err += 1
+        else:
+            _out_mf = execute_tool(
+                "tripletex_put",
+                {"path": "/employee/employment/884402", "body": {"division": {"id": 1}}},
+                _es,  # type: ignore[arg-type]
+            )
+            _d_mf = json.loads(_out_mf)
+            if not _d_mf.get("skipped") or _d_mf.get("minimalFallbackDivisionPutSkipped") != 1:
+                _fail(f"employment PUT division minimal-fallback skip: expected skipped+flag, got {_out_mf[:350]!r}")
+                err += 1
+            else:
+                _ok("employment PUT division: skip when POST was minimal-after-division-sweep (local)")
+    except Exception as e:
+        _fail(f"employment minimal-fallback PUT skip test: {e}")
         err += 1
 
     def _env_pop(key: str) -> Optional[str]:

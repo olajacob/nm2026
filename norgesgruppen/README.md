@@ -51,8 +51,12 @@ Kun filer som trengs i sandbox (spar plass — dropp gjerne `train.py` hvis du v
 
 ```bash
 cd nmai2026/norgesgruppen
-# For embedding-basert klassifisering i run.py: ta med NM_NGD_product_images/ + train/annotations.json
+# Embedding-basert klassifisering — velg én av disse:
+# A) Full bildebibliotek: NM_NGD_product_images/ (med metadata.json der) + train/annotations.json
+# B) Kompakt: product_embeddings.json (fra generate_embeddings.py) + resnet18-f37072fd.pth + metadata.json + train/annotations.json
 zip -r ../submission.zip run.py model.pt train/annotations.json NM_NGD_product_images -x ".*" "__MACOSX/*" "*/__pycache__/*"
+# alternativ (mindre zip, ingen pickle): product_embeddings.json i stedet for hele NM_NGD_product_images/
+# zip -r ../submission.zip run.py model.pt train/annotations.json metadata.json resnet18-f37072fd.pth product_embeddings.json -x ".*" "__MACOSX/*" "*/__pycache__/*"
 # valgfritt: legg til train.py om du vil -- tar én av max 10 .py-filer
 ```
 

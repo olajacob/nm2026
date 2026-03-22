@@ -18,7 +18,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import anthropic
 import time
-from datetime import datetime, timezone
+import calendar
+from datetime import date, datetime, timezone
 from urllib.parse import urlparse
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -160,13 +161,15 @@ def _resolve_task_label(req: SolveRequest, header_task_id: Optional[str]) -> str
     return "(not set — use JSON task_id, header X-Task-Id, or env TASK_ID / NM_TASK_ID)"
 
 
-# Per /solve: `/employee/employment/{id}` ids where PUT {division} returned 422 «Virksomheten kan ikke endres».
-_employment_division_locked_ids: set[int] = set()
+# Per /solve: `employment_id` → division **ids** that already returned 422 «Virksomheten kan ikke endres» on PUT.
+# **Do not** block PUT with a **different** division id — Lucy Walker run: PUT **division 1** failed but we had
+# wrongly blocked **division 2** via a global lock + salary-side lock, leaving **division** null and salary 422.
+_employment_division_put_rejected: dict[int, set[int]] = {}
 
 
 def _reset_per_solve_guards() -> None:
     """Call at the start of each POST /solve (same process may handle many requests)."""
-    _employment_division_locked_ids.clear()
+    _employment_division_put_rejected.clear()
 
 
 def _employment_id_from_path(path: str) -> Optional[int]:
@@ -217,9 +220,33 @@ def _enrich_salary_transaction_body(body: dict[str, Any]) -> dict[str, Any]:
 def _enrich_employment_post_body(body: dict[str, Any]) -> dict[str, Any]:
     """
     Pass-through. **Division on create** is handled in **`execute_tool`** via **`_employment_post_attempt_sequence`**
-    (minimal bodies: try **`division:{id:1..3}`** on **POST**, **404** each → next, then body without division).
+    (minimal bodies: try **`division:{id:1..N}`** on **POST**, **404** / division-related **422** → next id, then minimal).
     """
     return dict(body)
+
+
+def _enrich_travel_expense_post_body(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    **POST /travelExpense** shell: API rejects top-level **`paymentType`** (*Feltet eksisterer ikke i objektet*) and
+    string **`type`** (*Verdien er ikke av korrekt type*). **`paymentType`** belongs on **`POST /travelExpense/cost`** only.
+    """
+    b = dict(body)
+    if "paymentType" in b:
+        b.pop("paymentType")
+        _agent_print(
+            "  ℹ️  POST /travelExpense — stripped **paymentType** (not on shell — use **POST /travelExpense/cost**)."
+        )
+    tr = b.get("type")
+    if isinstance(tr, str):
+        u = tr.strip().upper()
+        if u == "TRAVEL":
+            b["type"] = 0
+        else:
+            b.pop("type", None)
+            _agent_print(
+                f"  ℹ️  POST /travelExpense — removed string **type** {tr!r} (invalid); API default / numeric enum only."
+            )
+    return b
 
 
 def _is_minimal_employment_post_body(body: dict[str, Any]) -> bool:
@@ -232,43 +259,92 @@ def _is_minimal_employment_post_body(body: dict[str, Any]) -> bool:
     return bool(body.get("startDate"))
 
 
+def _employment_body_has_explicit_division(body: dict[str, Any]) -> bool:
+    """True when model already set a concrete **division.id** (do not override with auto-sequence)."""
+    d = body.get("division")
+    return isinstance(d, dict) and d.get("id") is not None
+
+
+def _employment_division_post_ids() -> tuple[int, ...]:
+    """How many **division** `{id: 1..N}` attempts to make on **POST** before minimal body (env-tunable)."""
+    try:
+        n = int(os.environ.get("TRIPLETEX_EMPLOYMENT_DIVISION_POST_TRIES", "12"))
+    except (TypeError, ValueError):
+        n = 12
+    n = max(1, min(12, n))
+    return tuple(range(1, n + 1))
+
+
 def _employment_post_attempt_sequence(body: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    Ordered bodies for **POST /employee/employment**. Tenants may **404** when **`division`** is wrong/absent pattern;
-    **PUT** `division` after minimal create often **422** *«Virksomheten kan ikke endres»* — so try **division ids 1→2→3**
-    on **POST** (each step **only** after prior **HTTP 404**), then minimal `{employee, startDate}`.
+    Ordered bodies for **POST /employee/employment**. Tenants may **404** or **422** when **`division`** is wrong;
+    try **division ids** **1..N** on **POST** (continue to next id on **HTTP 404**, and on **422** when the error
+    text looks **division-related** — see **`execute_tool`** loop), then minimal **`{employee:{id},startDate}`**.
+    Top-level keys must be **only** **`employee`** + **`startDate`** (no **`division`**); **`employee`** may include
+    **`url`** etc. — it is normalised to **`{id}`** for each attempt. **`TRIPLETEX_EMPLOYMENT_DIVISION_POST_TRIES`**
+    (default **12**, max 12).
     """
     b = dict(body)
-    if not _is_minimal_employment_post_body(b):
+    if _employment_body_has_explicit_division(b):
         return [b]
-    if b.get("division") is not None:
+    if set(b.keys()) != {"employee", "startDate"}:
         return [b]
+    emp = b.get("employee")
+    sd = b.get("startDate")
+    if not isinstance(emp, dict) or emp.get("id") is None or not sd:
+        return [b]
+    base = {"employee": {"id": emp["id"]}, "startDate": sd}
     out: list[dict[str, Any]] = []
-    for div_id in (1, 2, 3):
-        out.append({**b, "division": {"id": div_id}})
-    out.append(b)
+    for div_id in _employment_division_post_ids():
+        out.append({**base, "division": {"id": div_id}})
+    out.append(dict(base))
     return out
 
 
-def _lock_employments_for_employees(api: "TripletexAPI", employee_ids: set[int]) -> None:
-    """After salary 422 «ikke knyttet mot en virksomhet», block further PUT division on those employment rows."""
-    for eid in employee_ids:
-        try:
-            r = api.get(
-                "/employee/employment",
-                params={"employeeId": eid, "fields": "id"},
-            )
-        except Exception:
-            continue
-        vals = r.get("values") if isinstance(r, dict) else None
-        if not isinstance(vals, list):
-            continue
-        for row in vals:
-            if isinstance(row, dict) and row.get("id") is not None:
-                try:
-                    _employment_division_locked_ids.add(int(row["id"]))
-                except (TypeError, ValueError):
-                    pass
+def _record_employment_post_minimal_division_fallback(
+    api: "TripletexAPI",
+    body_out: dict[str, Any],
+    success_bod: dict[str, Any],
+    result: Optional[dict[str, Any]],
+) -> None:
+    """
+    When **POST /employee/employment** succeeds with **`{employee,startDate}`** only after trying **`division:{id:1..N}`**,
+    **`division`** is usually **null** and **PUT** *«Virksomheten kan ikke endres»* is common — record **`employment id`**
+    so **`tripletex_put`** can skip useless division PUTs.
+    """
+    if _employment_body_has_explicit_division(success_bod):
+        return
+    if not _is_minimal_employment_post_body(success_bod):
+        return
+    if len(_employment_post_attempt_sequence(body_out)) <= 1:
+        return
+    if not isinstance(result, dict):
+        return
+    val = result.get("value")
+    if not isinstance(val, dict) or val.get("id") is None:
+        return
+    try:
+        eid = int(val["id"])
+    except (TypeError, ValueError):
+        return
+    bag = getattr(api, "employment_post_minimal_fallback_ids", None)
+    if bag is not None:
+        bag.add(eid)
+
+
+def _employment_post_422_division_related(detail: str) -> bool:
+    t = (detail or "").lower()
+    return "division" in t or "virksomhet" in t
+
+
+def _division_id_from_employment_put_body(body: dict[str, Any]) -> Optional[int]:
+    d = body.get("division")
+    if not isinstance(d, dict) or d.get("id") is None:
+        return None
+    try:
+        return int(d["id"])
+    except (TypeError, ValueError):
+        return None
 
 
 # Outgoing sales VAT on **order lines** — Norwegian competition chart defaults.
@@ -328,23 +404,6 @@ def _enrich_order_post_body(body: dict[str, Any]) -> dict[str, Any]:
         new_lines.append(ln)
     b["orderLines"] = new_lines
     return b
-
-
-def _employee_ids_from_salary_transaction_body(body: dict[str, Any]) -> set[int]:
-    out: set[int] = set()
-    payslips = body.get("payslips")
-    if not isinstance(payslips, list):
-        return out
-    for ps in payslips:
-        if not isinstance(ps, dict):
-            continue
-        emp = ps.get("employee")
-        if isinstance(emp, dict) and emp.get("id") is not None:
-            try:
-                out.add(int(emp["id"]))
-            except (TypeError, ValueError):
-                pass
-    return out
 
 
 # ── Tripletex API helper ──────────────────────────────────────────────────────
@@ -428,11 +487,11 @@ def _sanitize_invoice_list_fields_dict(p: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sanitize_activity_fields_dict(p: dict[str, Any]) -> None:
-    """**ActivityDTO** `fields` filter rejects **isInactive** (400 *Illegal field*) on list and detail GET."""
+    """**ActivityDTO** `fields` filter rejects **isInactive** and **activityNumber** (400 *Illegal field*) on list/detail GET."""
     fields = p.get("fields")
     if not isinstance(fields, str) or not fields.strip():
         return
-    banned = {"isInactive"}
+    banned = {"isInactive", "activityNumber"}
     seen: set[str] = set()
     out: list[str] = []
     for raw in fields.split(","):
@@ -464,6 +523,36 @@ def _ledger_account_3400_fee_credit_quirk_note(
         "**credit** for **purregebyr** / **reminder fee** **inntekt**. **`GET /ledger/account?number=…&fields=id,number,name`** "
         "for a **gebyr**/**provision**/**service** income account the task implies (e.g. **8040**, **8050**) until **`name`** fits."
     )
+
+
+def _clamp_invalid_iso_calendar_date(raw: str) -> tuple[str, bool]:
+    """
+    If **raw** starts with **YYYY-MM-DD** but the day is out of range for that month (e.g. **2026-03-32**),
+    clamp to the last valid day. Preserves any suffix after the first 10 chars.
+    """
+    if not isinstance(raw, str) or len(raw) < 10:
+        return raw, False
+    head, tail = raw[:10], raw[10:]
+    try:
+        date.fromisoformat(head)
+        return raw, False
+    except ValueError:
+        pass
+    parts = head.split("-")
+    if len(parts) != 3:
+        return raw, False
+    try:
+        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return raw, False
+    if not (1 <= y <= 9999 and 1 <= m <= 12):
+        return raw, False
+    last = calendar.monthrange(y, m)[1]
+    dc = min(max(1, d), last)
+    new_head = f"{y:04d}-{m:02d}-{dc:02d}"
+    if new_head == head:
+        return raw, False
+    return new_head + tail, True
 
 
 def _apply_tripletex_get_sanitizers(
@@ -534,8 +623,27 @@ def _apply_tripletex_get_sanitizers(
             after = p.get("fields") if isinstance(p.get("fields"), str) else None
             if before is not None and after != before:
                 notes.append(
-                    "GET /activity: dropped **isInactive** from `fields` — not a valid **ActivityDTO** filter (**400**)."
+                    "GET /activity: dropped **isInactive** / **activityNumber** from `fields` — not valid **ActivityDTO** filters (**400**)."
                 )
+
+    if path_only == "/ledger/voucher":
+        clamped_keys: list[str] = []
+        for dk in ("dateFrom", "dateTo"):
+            if dk not in p:
+                continue
+            raw = p.get(dk)
+            if not isinstance(raw, str):
+                continue
+            fixed, did = _clamp_invalid_iso_calendar_date(raw)
+            if did:
+                p[dk] = fixed
+                clamped_keys.append(dk)
+        if clamped_keys:
+            notes.append(
+                "GET /ledger/voucher: clamped invalid "
+                + ", ".join(f"`{k}`" for k in clamped_keys)
+                + " to a valid calendar **YYYY-MM-DD** (out-of-range day → last day of month)."
+            )
 
     return p, notes
 
@@ -1127,6 +1235,8 @@ class TripletexAPI:
         self.session.mount("http://", _adapter)
         # Per TripletexAPI instance (one per POST /solve) — duplicate POST /supplierInvoice guard.
         self.supplier_invoice_500_seen: set[str] = set()
+        # Employment **id**s created with minimal POST after division sweep failed on create (PUT division usually useless).
+        self.employment_post_minimal_fallback_ids: set[int] = set()
         # Per /solve session: travel cost categories by id (from GET /travelExpense/costCategory/{id})
         self._travel_cost_category_cache: dict[int, dict[str, Any]] = {}
         # Idempotent GETs (account by number, paymentType lists, vatType) — reduces duplicate 4xx-prone spam.
@@ -1379,20 +1489,21 @@ TOOLS = [
             "/ledger/accountingDimensionValue ({displayName})\n"
             "**Ledger / journal vouchers:** use **`tripletex_post_voucher`** — **not** **`tripletex_post`** on **`/ledger/voucher`** (see that tool).\n"
             "POST /customer: include **email** (and phone, org number) in body whenever the user prompt mentions them — "
-            "omitting stated email breaks automated checks. **Supplier-only** tasks → **`isSupplier: true`** and **`isCustomer: false`**; if **POST** response still shows **`isCustomer: true`**, **`PUT /customer/{id}`** **`{isCustomer: false}`** (see SYSTEM_PROMPT). **Customer-only** → **`isCustomer: true`**, **`isSupplier: false`** unless prompt says both. See SYSTEM_PROMPT **Create customer / supplier**.\n"
+            "omitting stated email breaks automated checks. **Supplier-only** tasks → **`isSupplier: true`** and **`isCustomer: false`** on **POST**; **GET** after **one** **`PUT`** if needed — if **`isCustomer`** stays **`true`**, **accept** and continue (**`isSupplier: true`** suffices for supplier flows; see SYSTEM_PROMPT). **Customer-only** → **`isCustomer: true`**, **`isSupplier: false`** unless prompt says both. See SYSTEM_PROMPT **Create customer / supplier**.\n"
             "POST /product: **priceExcludingVatCurrency** (not \"price\" — 422). **vatType**: **outgoing** sales code for the product’s **default**; **not** incoming/fradrag **id 1**. For **invoices with different VAT % per line**, set **`vatType: {id}`** on **each** **`orderLines[]`** entry (see SYSTEM_PROMPT — do **not** rely on product default alone). Travel costs use different vat rules — SYSTEM_PROMPT. "
             "**Before** POST, **GET /product** with **`name`** and/or **`productNumber`** + **`fields`** — if a row matches, **reuse** **id** (no POST). "
             "If **422** **«Produktnummeret … er i bruk»** or **«Produktnavnet … er allerede registrert»**, **do not** burn calls on invented POST bodies — **GET /product**, **reuse** existing **id**; only if still no row, **retry POST** **without** **`number`** (duplicate-number case).\n"
             "POST /department: body **{name: \"...\"}** — multiple departments → **separate POST** per name (see SYSTEM_PROMPT).\n"
-            "POST /employee: requires **userType** (e.g. STANDARD) and **department: {id}**; use **POST /employee/employment** for startDate / tax — not nested employmentDetails on /employee. **Always** **`GET /employee?email=…&fields=id,firstName,lastName`** **before** **POST /employee** with a **non-empty** email from the task/PDF — **`execute_tool`** **rejects** **`email:\"\"`**. See SYSTEM_PROMPT **Create employee Step 0**.\n"
-            "Payroll: **before** **POST /employee/employment**, **GET /employee/{id}?fields=dateOfBirth** — if **null**, **PUT /employee/{id}** **`{dateOfBirth: …}`**. **POST /employee/employment**: model sends **`{employee, startDate}`** — **`execute_tool`** tries **`division:{id:1}`**, then **2**, then **3** on **POST** (**HTTP 404** → next); then **minimal** body. **Non-minimal** POST **404** → strip to **`employee`+`startDate`**. **Stillingsprosent** → **`POST /employee/employment/details`**, **not** **`PUT …/employment/{id}`** with **`percentageOfFullTimeEquivalent`** (see SYSTEM_PROMPT).\n"
-            "POST /project: **startDate** is required (422 if missing); resolve **projectManager** via GET /employee with email filter if needed.\n"
-            "POST /timesheet/entry: **project**, **activity**, **employee**, **date**, **hours** (see SYSTEM_PROMPT).\n"
+            "POST /employee: requires **userType** (e.g. STANDARD), **department: {id}**, and **non-empty** **email** (body) — **`execute_tool`** **skips** **HTTP** if **email** is missing/empty (*Må angis for Tripletex-brukere*). **Always** **`GET /employee?email=…&fields=id,firstName,lastName`** **before** **POST** with the same email from the task/PDF — **`execute_tool`** **rejects** empty **`email`** on **GET** and **POST**. See SYSTEM_PROMPT **Create employee Step 0**.\n"
+            "Payroll: **before** **POST /employee/employment**, **GET /employee/{id}?fields=dateOfBirth** — if **null**, **PUT /employee/{id}** **`{dateOfBirth: …}`**. **POST /employee/employment**: model sends **`{employee, startDate}`** — **`execute_tool`** tries **`division:{id:1..N}`** on **POST** (**N** default **12**, env **`TRIPLETEX_EMPLOYMENT_DIVISION_POST_TRIES`**; **HTTP 404** or **422** when message mentions **division**/**virksomhet** → next id); then **minimal** body. **`employee`** may include **`url`** — normalised to **`{id}`** for the sweep. **Non-minimal** POST **404** → strip to **`employee`+`startDate`**. **Stillingsprosent** → **`POST /employee/employment/details`**, **not** **`PUT …/employment/{id}`** with **`percentageOfFullTimeEquivalent`** (see SYSTEM_PROMPT).\n"
+            "POST /project: **startDate** and **projectManager: {id}** are required (422 *Prosjektleder* if missing); **`execute_tool`** skips POST without **projectManager.id** — **GET /employee** first.\n"
+            "POST /activity: **activityType** required (422 if null) — **`{id: N}`** **or** string enum as on **GET /activity** (**GENERAL_ACTIVITY**, **PROJECT_GENERAL_ACTIVITY**). **`execute_tool`** skips bodies with **no** **activityType**; **GET /activityType** may **404** on some tenants.\n"
+            "POST /timesheet/entry: **project**, **activity**, **employee**, **date**, **hours** — **hours ≤ 24** per **date**; **`execute_tool`** skips **hours > 24** (see SYSTEM_PROMPT).\n"
             "Invoice bank (before **:invoice**): **GET /ledger/account** **`number=1920`**, **`fields=id,number,bankAccountNumber`** → **`tripletex_put` `PUT /ledger/account/{id}`** body **`{bankAccountNumber: \"86011117947\"}`** only — **do not** **POST** **1921**.\n"
             "Custom dimensions: **POST /ledger/accountingDimensionName** / **POST /ledger/accountingDimensionValue** — see SYSTEM_PROMPT.\n"
             "**Journal vouchers:** **`tripletex_post_voucher`** only — see that tool and SYSTEM_PROMPT (**never** raw **`tripletex_post`** to **`/ledger/voucher`** for manual journal lines).\n"
-            "Travel: **POST /travelExpense** uses nested **travelDetails** for departureDate/returnDate/destination/purpose/etc. — not top-level. "
-            "**POST /travelExpense/perDiemCompensation** only for **type TRAVEL** reports (not expense reports). "
+            "Travel: **POST /travelExpense** shell uses nested **travelDetails** (departureDate/returnDate/destination/purpose) — **not** top-level **paymentType** (*Feltet eksisterer ikke* — **`paymentType`** only on **POST /travelExpense/cost**). **type**: numeric (e.g. **0**) or omit — **not** the string **TRAVEL**; **`execute_tool`** strips bad **paymentType** / normalises string **TRAVEL** → **0**. "
+            "**POST /travelExpense/perDiemCompensation** only for travel reports (not pure employee expense reports). "
             "**POST /travelExpense/cost**: **amountCurrencyIncVat** (NOT amountCurrencyInclVAT), **amountNOKInclVAT**, **comments** (NOT description), "
             "**paymentType** (NOT paymentCurrency). **`GET /travelExpense/paymentType?fields=id`** — **not** **`name`** in **fields**. Resolve **costCategory** after listing/enriching categories (see SYSTEM_PROMPT). **vatType**: often **{id: 1}** for domestic VAT and **{id: 0}** for per-diem/diett lines — do **not** assume **1** for every line.\n"
             "POST /order: **deliveryDate** is required (422 \"deliveryDate\" null) — set to same as **orderDate** if not specified. "
@@ -1407,7 +1518,7 @@ TOOLS = [
             "**Supplier invoice payment:** **POST** `/supplierInvoice/{invoiceId}/:addPayment` — **this tool** with **body** **`{}`** and **params** per OpenAPI: "
             "**paymentType** (required; **0** = use last type for vendor when combined with tenant setup), **amount**, **paymentDate**, "
             "**partialPayment: true** when registering a **partial** payment, optional **kidOrReceiverReference**, **useDefaultPaymentType**.\n"
-            "**POST /employee/employment**: for **`{employee, startDate}`** only, runtime tries **`division:{id:1..3}`** on **POST** (**404** → next id, then minimal). **Non-minimal** body **404** → strip to **employee**+**startDate**. **`GET /salary/type`**: **`fields`** **id,name** only — **`displayName`** **400** (sanitized in **`TripletexAPI.get`**).\n"
+            "**POST /employee/employment**: for **`{employee, startDate}`** only (top-level keys), runtime tries **`division:{id:1..N}`** on **POST** (**404** or division-related **422** → next id, then minimal; **N** default **12**). **Non-minimal** body **404** → strip to **employee**+**startDate**. **`GET /salary/type`**: **`fields`** **id,name** only — **`displayName`** **400** (sanitized in **`TripletexAPI.get`**).\n"
             "**POST /salary/transaction**: optional **`params`** e.g. **`{generateTaxDeduction: true}`**. Each **`payslips[].specifications[]`** line with **`amount`** must include **`count`** and **`rate`** (non-null) — e.g. **`count: 1`**, **`rate`** = same as **`amount`** for monthly fixed pay; **`execute_tool`** auto-fills missing **`count`/`rate`** from **`amount`**.\n"
             "Returns the created resource JSON for the requested path."
         ),
@@ -1478,7 +1589,7 @@ TOOLS = [
             "Examples: PUT /employee/123 {\"firstName\": \"...\"}, PUT /customer/456, "
             "**PUT /ledger/account/{id}** with **`{bankAccountNumber: \"86011117947\"}`** after **`GET /ledger/account?number=1920&fields=id,number,bankAccountNumber`** — see SYSTEM_PROMPT.\n"
             "**PUT /employee/{id}** **`{dateOfBirth: \"YYYY-MM-DD\"}`** when **`POST /employee/employment`** fails with **employee.dateOfBirth** required (often **null** on pre-seeded employees) — prompt date or **`1990-01-01`** if silent.\n"
-            "**PUT /employee/employment/{id}** with **`{division: {id: N}}`** when **division** may be set — try **N=1**, then **2**, **3** on **403** only; **422** *«Virksomheten kan ikke endres»* → **do not** retry other ids (see SYSTEM_PROMPT).\n"
+            "**PUT /employee/employment/{id}** with **`{division: {id: N}}`** when **division** is **null** — try **N=1**, then **2**, **3** (on **403** retry next id). **422** *«Virksomheten kan ikke endres»* for a given **N** → try **another** **N**; runtime skips only **re-PUT** the **same** **N** that already 422’d.\n"
             "Do NOT use this for Tripletex path actions (URLs containing /:actionName such as "
             "/:invoice or /:createCreditNote) — use tripletex_put_action for those."
         ),
@@ -1543,7 +1654,7 @@ TOOLS = [
 
 SYSTEM_PROMPT = """You are an expert Tripletex accounting agent. Complete tasks precisely via the Tripletex v2 REST API.
 
-**WHEN TO SKIP account 1920 (read this first):** The **`GET /ledger/account` 1920 + `PUT` bankAccountNumber** block below is **only** for tasks that **create an outgoing customer invoice** — i.e. you will call **`PUT /order/{id}/:invoice`** (or invoice-from-multiple-orders) **or** the prompt explicitly requires **invoice bank / faktura / KID** setup **for sending invoices**. **Do not** run it for **pure project setup** (e.g. **Festpreis** / **fixed price** **`isFixedPrice`+`fixedprice`**, project manager, **`POST /project`** + **`PUT /project`** only), **timesheets**, **hourly rate rows**, **travel**, **payroll**, **manual ledger vouchers**, **dimensions**, or **customer/product master data** with **no** **`:invoice`** step — those waste API calls and hurt **efficiency**.
+**WHEN TO SKIP account 1920 (read this first):** The **`GET /ledger/account` 1920 + `PUT` bankAccountNumber** block below is **only** for tasks that **create an outgoing customer invoice** — i.e. you will call **`PUT /order/{id}/:invoice`** (or invoice-from-multiple-orders) **or** the prompt explicitly requires **invoice bank / faktura / KID** setup **for sending invoices**. **Do not** run it for **pure project setup** (e.g. **Festpreis** / **fixed price** **`isFixedPrice`+`fixedprice`**, project manager, **`POST /project`** + **`PUT /project`** only), **timesheets**, **hourly rate rows**, **travel**, **payroll**, **manual ledger vouchers**, **dimensions**, or **customer/product master data** with **no** **`:invoice`** step — those waste API calls and hurt **efficiency**. **German DE — efficiency:** **Auftrag** + **in eine Rechnung** / **Rechnung** without wording about **Rechnungsbank** / **KID** / **Bankverbindung** on the invoice → **defer** **1920** **GET/PUT** until **`PUT /order/.../:invoice`** returns **422** mentioning **bank** / **bankkontonummer** — then run **MANDATORY SETUP** once and **retry** (saves **2** calls when the tenant already accepts **:invoice**). **French FR — same:** **cycle de vie** / **projet** / **facture** / **transformer** … **en facture** with **no** **RIB** / **coordonnées bancaires** on the invoice → **defer** **1920** until **`:invoice`** **422** about bank, then setup once.
 
 MANDATORY SETUP BEFORE INVOICE TASKS (1920 — **only if you will `PUT .../:invoice`**):
 If the task involves **creating an invoice** (**`PUT /order/{id}/:invoice`**), **do not** **`POST /ledger/account`** a new **1921** — **update** ledger account **1920** (competition invoice bank — **`isInvoiceAccount`** is already **true**; often only **`bankAccountNumber`** is empty).
@@ -1580,6 +1691,7 @@ If you are **not** about to **`:invoice`**, **skip** this entire 1920 block (see
 
 LANGUAGES: Tasks arrive in Norwegian, Nynorsk, English, German, French, Spanish, or Portuguese. Understand fully before acting. **Invoice «send» cues:** e.g. **send** / **e-post** / **email** (EN/NO), **enviar** / **envie** / **mandar** (PT/ES), **envoyer** (FR), **senden** / **versenden** (DE) — if present, you must **`PUT /invoice/{id}/:send`** after **`:invoice`** (see **Create invoice**).
 **German (DE) — ledger / cost analysis:** **Hauptbuch**, **Aufwandskonten**, **Kosten**, **Januar**/**Februar** comparisons → **`GET /ledger/voucher`** + voucher **postings**; sum **debit** on expense accounts (classes **5–8**). **Do not** **`POST /project`** / **`POST /customer`** when the task is **only** analysis or ranking accounts — create entities **only** if wording **explicitly** requires **Projekt**/**Kunde**/registration.
+**French (FR) / EN — coûts, grand livre, Jan–Feb spike + internal project:** **coûts totaux**, **grand livre**, **comptes de charges**, **augmentation**, **janvier**/**février** (or EN **January**/**February** / **general ledger** / **expense accounts** / **internal project**) → same **`GET /ledger/voucher`** + **`GET /ledger/voucher/{id}`** postings; per month sum **`amount`** on **expense** lines (**`account.number`** typically **5xxx–8xxx**, **`amount` > 0**); rank accounts by **(later month total − earlier month total)**. If the task asks for **one** internal / analysis project (**un projet interne**, **singular**), **`POST /project` once** with a **project name** that reflects the **analysis** (not **three** projects named after each **GL account description**) **unless** the prompt explicitly requires **separate** projects per account. **`projectManager: {id}`** is **mandatory** — **`GET /employee`** first. **Do not** **`POST /activity`** without **`activityType`** — use **`{id: N}`** **or** the **string enum** on **`GET /activity`** (**GENERAL_ACTIVITY**, **PROJECT_GENERAL_ACTIVITY**, …). **`GET /activityType`** often **404** — do **not** loop on it; copy **`activityType`** from **`GET /activity`** instead.
 
 SCORING — THIS MATTERS:
 - You are scored on CORRECTNESS (field-by-field checks) and EFFICIENCY (API call count + zero 4xx errors)
@@ -1610,7 +1722,7 @@ TRIPLETEX API KNOWLEDGE:
 - POST /order: **deliveryDate** is **required** (422 if null). If the prompt does not give a delivery date, use the same **YYYY-MM-DD** as **orderDate**
 - **Order lines + VAT (invoices):** **`orderLines[]`** supports **`vatType: {id}`** (same **outgoing** sales codes as products). If the task gives **different VAT % per line**, set **`vatType` on every line** from the task — **do not** assume the **product** master **vatType** matches each line. **Standard Norwegian outgoing** **id** shortcut (competition — **skip GET /ledger/vatType** unless the rate is unusual or **POST /order** **422**): **25% → 3**, **15% → 31**, **12% → 32**, **0% → 6**. **Efficiency:** after **PUT /order/{id}/:invoice** returns **success**, **do not** **GET /invoice/{id}** only to re-read line VAT unless the prompt explicitly asks for verification or payment amounts you cannot compute.
 - Auth: already handled — just make the calls
-- **403 "Invalid or expired token"** mid-session: usually **competition proxy** / expired **session_token** — **infrastructure**, not a broken request body. **Do not** abandon the run after **one** 403: **still execute your remaining planned tool calls** (e.g. **POST /department** for **each** name you intended, or retry the sequence) — the token may succeed on **other** endpoints or moments. **Never** `end_turn` early **only** because a single call returned 403. A **fresh** `session_token` is required for a clean run; if 403 is **frequent**, raise it with **organisers** (not fully fixable in agent code). **Prevention:** **minimize** **`GET /ledger/account`** pagination — use **`number=…`** for each stated GL code so the proxy budget lasts through **`tripletex_post_voucher`**.
+- **403** mid-session: **If** tool **`details`** mention **nmiai-proxy** and **Invalid or expired proxy token**, the **submission** token is **dead** — **do not** invent **`ledger/account` ids** (e.g. **1**, **2**) or **`end_turn`** as if postings succeeded; need a **fresh** `session_token` from the platform. **Otherwise** (isolated **403** without that message): **still execute** remaining planned calls — the token may work on the next request. **Prevention:** **minimize** **`GET /ledger/account`** pagination — use **`number=…`** per stated GL code so the proxy budget lasts through **`tripletex_post_voucher`**.
 - **GET /ledger/account** for **bilag** lines: When the prompt gives **kontonummer** / **account numbers** / **compte** / **GL** codes, resolve each with **`GET /ledger/account?number=N&fields=id,number,name`** (**one call per** **N**). **Avoid** scanning the full chart with **`from`/`count`** unless you must search by **name** once.
 - **Company bank account for invoicing:** **`Company`** has **no** bank fields in the API. **`GET /ledger/account?number=1920&fields=id,number,bankAccountNumber`** → **`PUT /ledger/account/{id}`** **`{bankAccountNumber: \"86011117947\"}`** — **not** **`POST` 1921**.
 
@@ -1628,6 +1740,7 @@ CRITICAL: Several departments → **one POST /department per department** (separ
 Create employee:
 Step 0 — **Before any POST /employee** for a named person: **tripletex_get** **`GET /employee?email=<their email>&fields=id,firstName,lastName`** — **`email`** must be non-empty (from prompt/PDF). If **`values`** contains a match, **reuse** **`id`** (project manager, timesheet, employment, etc.) — **never** **POST /employee** for that email (**422** *«Det finnes allerede en bruker med denne e-postadressen»* / duplicate user). Repeat Step **0** for **each** distinct email the task names before creating anyone new.
 Step 1 — **`GET /department?fields=id,name`**. Choose **`department.id`** from the row that matches the PDF/prompt; **only** if **no** row matches, **`POST /department`** once with the required name (see **Create department**).
+**Dates (NO + English months):** Prompts like *13. January 2026* or *9. November 1995* → API **`YYYY-MM-DD`** (**2026-01-13**, **1995-11-09**) for **`startDate`** / **`dateOfBirth`** — **not** literal *January* / *November* text inside JSON strings.
 Step 2 — **Only if Step 0 returned no row** for that person: POST /employee {
   firstName,
   lastName,
@@ -1641,16 +1754,17 @@ Step 3 — **POST /employee/employment** when the task needs employment (incl. *
 
 **POST /employee/employment — body from the model:** Send **`{employee: {id}, startDate: "YYYY-MM-DD"}`** (plus any extra fields Swagger allows). **Semantics:** **`department`** on **`POST /employee`** = organisasjons**avdeling**; **`division`** on **employment** = **virksomhet** for **lønn** (**`POST /salary/transaction`** requires employment linked to a **division**).
 
-**Runtime (`execute_tool`):** If the body is **exactly** **`employee` + `startDate`**, the tool **POST**s with **`division: {id: 1}`**, then **`2`**, then **`3`** — each step only after **HTTP 404** on the previous — then **minimal** without **`division`**. **Non-minimal** **POST** **404** → strip to **`{employee, startDate}`** once. Goal: avoid **422** *«Virksomheten kan ikke endres»* on **PUT** **division** when a tenant accepts **`division`** only on **create** for a specific id.
+**Runtime (`execute_tool`):** If the body has **only** top-level **`employee`** + **`startDate`** (no explicit **`division.id`**), the tool **POST**s with **`division: {id: 1..N}`** (**N** default **12**, env **`TRIPLETEX_EMPLOYMENT_DIVISION_POST_TRIES`**, max **12**) — **HTTP 404** on the previous attempt, or **422** whose text mentions **division** / **virksomhet**, → try the next id — then **minimal** without **`division`**. **`employee`** is normalised to **`{id}`** for these attempts (Swagger **`url`** on **`employee`** no longer disables the sweep). **Non-minimal** **POST** **404** → strip to **`{employee, startDate}`** once. Goal: set **virksomhet** on **create** when the tenant allows a **division** id in **1..N**.
 
 **After** **200**: **GET** **`/employee/employment?employeeId=…&fields=id,startDate,division`**. If **`division`** is **already** set (create-time shortcut worked), **skip** **Step 4** **PUT** **division**. Else **`PUT /employee/employment/{id}`** for **`isMainEmployer`**, **`taxDeductionCode`**, etc. when accepted.
 
 Step 4 — **Link employment → division (virksomhet)** — only if **`GET`** still shows **`division: null`**; error *«Arbeidsforholdet er ikke knyttet mot en virksomhet»* on salary means **`division`** was never set:
 - **Do not** rely on **`GET /company/divisions`** — it often returns **403** in competition; **do not** stall the run on it.
 - **tripletex_get** **`GET /employee/employment/{employmentId}?fields=id,division`**.
-- If **`division`** is **null** / missing: **tripletex_put** **`PUT /employee/employment/{employmentId}`** with JSON **`{"division": {"id": 1}}`**. On **403**, retry **`{"division": {"id": 2}}`**, then **`{"division": {"id": 3}}`**, logging each attempt.
-- **422** *«Virksomheten kan ikke endres»* on **any** **`PUT`** with **`division`**: **stop immediately** — **never** send **`PUT`** with **`division` 2** or **3** (or any other id) for **this** **`employmentId`** in the same run. The runtime may **block** further division **PUT**s after the first such **422**. **Continue** with **`POST /salary/transaction`** (tenant may still accept payroll); if **that** fails on **virksomhet**, it is likely **sandbox/company setup**, not missing retries.
+- If **`division`** is **null** / missing: **tripletex_put** **`PUT /employee/employment/{employmentId}`** with JSON **`{"division": {"id": 1}}`**. On **403**, retry **`id: 2`**, then **`3`**. On **422** *«Virksomheten kan ikke endres»* for **`id: 1`**, **still try** **`id: 2`** and **`3`** — some tenants reject one **virksomhet** id but accept another; runtime only blocks **repeating** the **same** **id** that already 422’d. **Efficiency:** if **id 1** and **id 2** both 422 with that message, **`execute_tool`** skips the **HTTP** for **id 3** (same tenant pattern — avoids a third 422).
+- **Minimal POST after division sweep:** If **POST /employee/employment** only **succeeded** with **`{employee,startDate}`** after runtime tried **`division:{id:1..N}`** on **create**, **`tripletex_put`** **division** for that **employment** **`id`** is **skipped** (**`minimalFallbackDivisionPutSkipped`**) — **do not** retry **PUT** **division**; same pattern as endless *«Virksomheten kan ikke endres»*.
 - **COMPETITION SHORTCUT:** **`division.id: 1`** often works when **PUT** is allowed — try **`1`** first once; after a **200**/**204**, **reuse** that **`id`** for other employments where **PUT** is allowed.
+- **Employee onboarding without payroll:** If the prompt only asks to **create** the **employee** and **employment** (no **lønn** / **salary** / **payroll**), and **`division`** stays **`null`** while **`PUT`** returns *«Virksomheten kan ikke endres»* for the **first** division **ids** you try, **do not** keep burning turns on more **`PUT`**s — the row is often **enough** for the grader. **Payroll** tasks **require** a linked **virksomhet** (see payroll runbook).
 
 Step 3b — **Stillingsprosent / årslønn** (**`POST /employee/employment/details`**): When the task gives **stillingsprosent** (e.g. 80%) and/or **årslønn** / **månedslønn**, register them **before** **`POST /salary/transaction`**:
 - **`employment`**: **`{id}`** = **`/employee/employment`** row **`id`** (**not** the employee **`id`**) from **`GET /employee/employment?employeeId=…`**
@@ -1673,17 +1787,17 @@ POST /customer {
 **Flags — set explicitly (Tripletex defaults `isCustomer` to true if omitted; graders often expect pure suppliers with `isCustomer: false`):**
 - **Customer only** (kunde, customer, client, …): **`isCustomer: true`**, **`isSupplier: false`** unless the prompt also makes them a supplier.
 - **Supplier only** (leverandør, supplier, proveedor, fournisseur, Lieferant, …): **`isSupplier: true`**, **`isCustomer: false`** — **always** send **`isCustomer: false`** on **POST**.
-- **Supplier-only — tenant quirk:** Many tenants **return** **`isCustomer: true`** in the **`POST /customer`** response **even when** you sent **`isCustomer: false`**. **Do not** trust **`POST`** alone — **persisted** state must be read via **GET**. After **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**: **(1)** **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** — **(2)** if **`isCustomer`** is still **`true`**, **`tripletex_put` `PUT /customer/{id}`** body **`{"isCustomer": false, "isSupplier": true}`** (both flags — some tenants ignore a lone **`isCustomer: false`**) — **(3)** **`GET`** again; if still **`isCustomer: true`**, **one more** **`PUT`** with the **same** two-field body, then continue — **do not** burn **>3** PUT round-trips. Then continue (e.g. **`POST /supplierInvoice`** or voucher fallback). **Do not** skip this when the task is **leverandør-only**.
+- **Supplier-only — tenant quirk:** Many tenants **return** **`isCustomer: true`** in the **`POST /customer`** response **even when** you sent **`isCustomer: false`**. **(1)** **`GET /customer/{id}?fields=id,isCustomer,isSupplier`**. **(2)** If **`isCustomer`** is still **`true`**, **one** **`tripletex_put` `PUT /customer/{id}`** with **`{"isCustomer": false, "isSupplier": true}`** (both flags — some tenants ignore a lone **`isCustomer: false`**). **(3)** **`GET`** again; if **`isCustomer`** is **still** **`true`**, **accept** — Tripletex often **cannot** clear **`isCustomer`** once the party exists; **`isSupplier: true`** is **enough** for **`POST /supplierInvoice`**, **`:addPayment`**, and voucher lines with **`supplier`**. **Do not** loop extra **`PUT`/`GET`** or treat the task as failed. Then continue (e.g. **`POST /supplierInvoice`** or voucher fallback).
 - **Both** roles only when the prompt **explicitly** says the entity is a customer **and** a supplier: **`isCustomer: true`**, **`isSupplier: true`**.
 CRITICAL: Never omit email or organizationNumber if they appear in the prompt.
 
-Register supplier invoice (leverandørfaktura) — **Task 23 pattern** (mottatt faktura, **fournisseur**, **supplier invoice**, **registrer leverandørfaktura**):
+Register supplier invoice (leverandørfaktura) — **Task 23 pattern** (mottatt faktura, **fournisseur**, **facture fournisseur**, **enregistrer la facture**, **supplier invoice**, **registrer leverandørfaktura**):
 When the task is to **record** / **register** / **book** a **received supplier invoice** (amount **TTC** / **inkl. MVA**, invoice number, cost account like **7300**), you **must** create the **supplier invoice** in Tripletex — **not** stop after **`POST /customer`**. **Do not** use **`tripletex_post_voucher`** / **`/ledger/voucher`** for this flow unless the tenant truly exposes no **`/supplierInvoice`** create — **primary path:** **`tripletex_post`** **`POST /supplierInvoice`**.
 
-1. **Supplier:** **`GET /customer?organizationNumber=X&fields=id,name,organizationNumber,isSupplier,isCustomer`** (and **`email`** if needed). If **no row**, **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**, **`name`**, **`organizationNumber`**, **`email`** when stated. **`supplier_id`** = matching **`values[].id`** from **GET**, or **`value.id`** from **`POST`**. For **supplier-only** tasks: **after** **`POST /customer`**, or whenever **`values[]`** / **`value`** shows **`isCustomer: true`**, follow **Supplier-only — tenant quirk**: **`GET /customer/{id}?fields=id,isCustomer,isSupplier`** (always include **`isCustomer`** in **`fields`** to verify persisted state **before** **`PUT`**) → **`PUT`** if needed → optional **second `GET`** to verify.
+1. **Supplier:** **`GET /customer?organizationNumber=X&fields=id,name,organizationNumber,isSupplier,isCustomer`** (and **`email`** if needed). If **no row**, **`POST /customer`** with **`isSupplier: true`**, **`isCustomer: false`**, **`name`**, **`organizationNumber`**, **`email`** when stated. **`supplier_id`** = matching **`values[].id`** from **GET**, or **`value.id`** from **`POST`**. For **supplier-only** tasks: follow **Supplier-only — tenant quirk** (**`GET`** → **at most one** **`PUT`** → **`GET`**; if **`isCustomer`** still **`true`**, **proceed** — do not stall).
 2. **Cost / expense account:** **one** **`GET /ledger/account?number=NNNN&fields=id,number,name`** for the **stated** GL (**7300**, etc.) — **do not** scan many account numbers «just in case»; use for **follow-up** (voucher / line edits) only after **`POST /supplierInvoice`** succeeds **or** if the API documents a **required** field you still lack.
 3. **Create invoice — `POST /supplierInvoice`:** Published OpenAPI often omits **POST** on **`/supplierInvoice`**, but the endpoint exists. **Standard body** (beløp **inkl. MVA** / TTC):
-   - **Probe result (NM competition sandbox, 2026-03):** Bodies with **`invoiceNumber`**, **`invoiceDate`**, **`supplier`**, **`amountCurrency`**, **`currency`**, with or without **`invoiceDueDate`**, **`orderLines`** (no **`account`** on lines), or **`amount`** instead of **`amountCurrency`**, consistently return **HTTP 500** **`code` 1000** with **empty** **`message`** / **`validationMessages`** — likely **tenant/module**, not a missing JSON field you can fix client-side. **`vatExemptAmount`**, **`vendorInvoiceNumber`**, **`department`** on create → **422** *Feltet eksisterer ikke*. **HTTP 500 + `code` 1000** — **do not** call **`tripletex_post` `/supplierInvoice` again** for the **same** **`invoiceNumber` + `supplier.id`**. **Immediately** use **`tripletex_post_voucher`**: **cost** + **inngående MVA** (**`vatType: {id: 1}`** on expense line **or** separate **2710** line per chart) + **leverandørgjeld** (**2400** or the chart’s AP account) with **`supplier: {id}`** on the **credit** line. **422** *«Kunde mangler»*: **supplier** and **customer** share the same **party** **`id`**; **`execute_tool`** copies **`supplier`**’s **`id`** onto **positive debit** lines as **`customer`** when debits lack it (or pass tool **`customer`** / **`supplier`** at root).
+   - **Probe result (NM competition sandbox, 2026-03):** Bodies with **`invoiceNumber`**, **`invoiceDate`**, **`supplier`**, **`amountCurrency`**, **`currency`**, with or without **`invoiceDueDate`**, **`orderLines`** (no **`account`** on lines), or **`amount`** instead of **`amountCurrency`**, consistently return **HTTP 500** **`code` 1000** with **empty** **`message`** / **`validationMessages`** — likely **tenant/module**, not a missing JSON field you can fix client-side. **`vatExemptAmount`**, **`vendorInvoiceNumber`**, **`department`** on create → **422** *Feltet eksisterer ikke*. **HTTP 500 + `code` 1000** — **do not** call **`tripletex_post` `/supplierInvoice` again** for the **same** **`invoiceNumber` + `supplier.id`**. **Immediately** use **`tripletex_post_voucher`**: **cost** + **inngående MVA** (**`vatType: {id: 1}`** on a **debit** expense account that **accepts** inngående VAT — **not** **7100** *Bilgodtgjørelse* / **7140** *Reise* if **`GET /ledger/account`** shows they are **locked to `vatType` 0**; use **6800**/**7300**/**6300**-class **or** **3-line**: net on expense **`vatType:0`**, **2710** VAT line, **credit 2400** with **`supplier:{id}`**) + **leverandørgjeld** (**2400**) — **always** **`supplier:{id}`** on the **credit** (**AP**) line (*«Leverandør mangler»* if omitted). **422** *«Kunde mangler»*: **supplier** and **customer** share the same **party** **`id`**; **`execute_tool`** copies **`supplier`**’s **`id`** onto **positive debit** lines as **`customer`** when debits lack it (or pass tool **`customer`** / **`supplier`** at root).
 ```json
 {"invoiceNumber": "INV-...", "invoiceDate": "YYYY-MM-DD", "supplier": {"id": supplier_id}, "amountCurrency": AMOUNT_INCL_VAT, "currency": {"id": 1}}
 ```
@@ -1729,6 +1843,10 @@ Create invoice (customer + order → invoice via path action):
 
 Bank reconciliation (bankavstemming):
 When the user message includes **`=== File: … ===`** with CSV/bank text (from **`files[]`** / bankutskrift), you **must** run the API flow below — **never** `end_turn` on the first iteration with **no** tool calls. **Reference:** repo **`knowledge/tripletex.md`** section **Bank reconciliation (bankavstemming)**.
+**German (DE) — same steps:** **Kontoauszug**, **beigefügte** / **angehängte CSV**, **Gutschriften** / **Haben**, **Lastschriften** / **Soll**, **Zahlungen zuordnen**, **mit offenen Rechnungen abgleichen**, **Kundenrechnungen**, **Lieferantenrechnungen** → follow 1–7 below.
+**Counterparty — do not use weak name search:** **`GET /customer?name=…`** (substring) often returns an **unrelated** first page on this API — **do not** invent **`POST /customer`** rows like **"Lieferant … GmbH"** when the CSV has **Org.-Nr.** / **USt-Id** / **Kundennummer**. Prefer **`GET /customer?organizationNumber=…`**, then match **KID** / **invoice #** / **amount** on **`GET /invoice`** / **`GET /supplierInvoice`**. If the party exists as **customer** only but pays as **vendor**, **`PUT /customer/{id}`** **`{isSupplier: true, isCustomer: true}`** (or as the task requires) **before** **`:addPayment`** — **reuse** **`id`**, **no** duplicate fake suppliers.
+**Several bank lines → same customer invoice:** after **each** **`PUT /invoice/{id}/:payment`**, **`GET /invoice/{id}`** again — **`amountOutstanding`** shrinks; the **next** **`paidAmount`** must reflect the **new** open balance or the **next** CSV line amount. Use **`partialPayment: true`** in **`:payment`** **params** when paying **less** than current outstanding (per OpenAPI).
+**Outgoing / supplier side when `GET /supplierInvoice` is empty:** widen **`invoiceDateFrom`/`invoiceDateTo`**, re-check open **AP**; **do not** default **`tripletex_post_voucher`** expense to **7140** (*Reise*) unless the CSV line is **travel**-like — **`GET /ledger/account?number=`** for a **6xxx** cost the text implies, or follow **`_toolNote`** after **POST /supplierInvoice** **500**/1000 with a **neutral** purchase account the task hints.
 
 1. **Parse the CSV** in that block: map columns for **date**, **description**, **amount**, **KID** / reference / message (headers differ per bank export). Infer **innbetaling** vs **utbetaling** from sign or column meaning.
 2. **tripletex_get** **GET /invoice** with **`invoiceDateFrom=2000-01-01`**, **`invoiceDateTo=2099-12-31`**, **`fields=id,invoiceNumber,amountExcludingVat,kid,customer`** (narrow dates or add **`kid`** query when the CSV has KID). Use **`amountOutstanding`** / **`amountCurrencyOutstanding`** in **`fields`** when the API accepts them to spot open items; if **`fields`** causes **400**, use **`id,invoiceNumber,invoiceDate,amountExcludingVat`** then **GET /invoice/{id}** for **kid** / outstanding before paying.
@@ -1785,9 +1903,12 @@ Reverse payment / bank return (betaling returnert — **not** cancelling the sal
 - **Do this instead:** **`GET /invoice/{invoiceId}?fields=id,invoiceNumber,postings`** (if **`postings`** looks incomplete, **`GET /invoice/{invoiceId}`** without a tight **`fields`** filter). Invoice **`postings`** include the **invoice line (positive)** and **payment line(s) (negative)**. Take **`voucher.id`** from the **payment** posting’s **`voucher`** (object or `{id}`).
 - **tripletex_put_action:** **`PUT /ledger/voucher/{voucherId}/:reverse`** with **`params`** **`{date: "YYYY-MM-DD"}`** — **`date`** is **required** (reverse-voucher date). Use the task’s return/reversal date.
 - **Optional verify:** **`GET /invoice/{invoiceId}`** — **outstanding** amounts should reflect the invoice being **unpaid** again.
+- **German cues:** **Zahlung** … **zurückgebucht** / **Rückbuchung**, **Stornieren Sie die Zahlung**, **Bank** … **zurück** → **not** **`:createCreditNote`** — use **`voucher.id`** from the **negative payment** posting → **`PUT /ledger/voucher/{id}/:reverse`** with **`params.date`** (payment / reversal date from the task).
 
 Credit note (cancel / credit the **sale** — e.g. customer keeps goods and gets a credit, **not** a bounced bank transfer):
   tripletex_put_action: PUT /invoice/{id}/:createCreditNote (e.g. ?date=YYYY-MM-DD per Swagger)
+**Norwegian cues:** **kreditnota**, **reklamasjon** / **reklamert**, **fullstendig kreditnota**, **reverserer (hele) fakturaen** → **`GET /customer?organizationNumber=…`** then **`GET /invoice?customerId=…`** → pick **`id`** for the matching **beløp** / **faktura** → **`tripletex_put_action`** with path **`/invoice/{id}/:createCreditNote`** and **`params.date`**.
+**Portuguese / Spanish cues:** **nota de crédito** / **nota de credito**, **Emita** … **completa**, **reverta** / **reverte** … **fatura** / **factura**, **reclamou** / **reclamó** → same **`GET /customer?organizationNumber=…`** + **`GET /invoice?customerId=…`** (match **amountExcludingVat** / line text) → **`PUT /invoice/{id}/:createCreditNote`** — **not** **`:reverse`** on a **payment** voucher (that is for **bank return**, not crediting the **sale**).
 
 Create project:
 POST /project {
@@ -1796,10 +1917,10 @@ POST /project {
   projectManager: {id: X},  # find via GET /employee?email=X
   startDate: "YYYY-MM-DD",  # REQUIRED — use today's date if not specified in prompt
 }
-**Portuguese cues:** **Crie o projeto** / **projeto** + **cliente** + **org. nº** / **nº** → **GET /customer?organizationNumber=…** then **GET /employee?email=…** for **gerente de projeto** / **project manager** → **POST /project** as above (**no** extra steps unless prompt asks).
-CRITICAL: startDate is required — always include it, use today (2026-03-19) if not given.
+**Portuguese / Spanish cues:** **Crie o projeto** / **Crea el proyecto** / **proyecto** + **cliente** + **org. nº** / **nº** / **n.º** → **GET /customer?organizationNumber=…** then **GET /employee?email=…** for **gerente de projeto** / **gestor de projeto** / **director del proyecto** / **project manager** → **POST /project** as above (**no** extra steps unless prompt asks).
+CRITICAL: **startDate** is required — always include it; if the prompt omits a date, use **today’s** **YYYY-MM-DD** or a date **explicitly named in the task**.
 Optional endDate if the task specifies an end.
-CRITICAL (efficiency): **Fixed price / Festpreis** on an existing or new project → **`PUT /project/{id}`** with **`isFixedPrice: true`** and **`fixedprice`** (NOK) after **`POST /project`** if needed. **No** **1920** bank setup unless the same task also requires **`:invoice`**.
+CRITICAL (efficiency): **Fixed price / Festpreis** / **PT** **preço fixo** / **Defina um preço fixo** on an existing or new project → **`PUT /project/{id}`** with **`isFixedPrice: true`** and **`fixedprice`** (NOK) after **`POST /project`** if needed. **PT** **Fature** … **%** do preço (or **facturar** / **% del precio**) → **product** **`priceExcludingVatCurrency`** = **that share of `fixedprice`** (amount **ex. VAT**); **POST /order** + **`:invoice`**. **No** **1920** bank setup unless the same task also requires **`:invoice`**.
 
 Full project lifecycle / hours / «ciclo de vida» / **timer**:
 When the task describes a **full project lifecycle**, **complete project**, **registrar horas** / **hours** / **timer** for **named employees**, or similar, you **must** execute **every** implied step — **do not** `end_turn` after **`POST /project`** or **`PUT /project`** alone.
@@ -1807,16 +1928,16 @@ When the task describes a **full project lifecycle**, **complete project**, **re
 **Required flow when hours or a «full» lifecycle are mentioned:**
 1. **POST /project** with **`customer`**, **`projectManager`**, **`startDate`** (and **`GET /employee?email=`** / **Create employee** steps as needed). If the task states a **budget** / **fixed price** / **Festpreis**, **`PUT /project/{id}`** with **`isFixedPrice: true`** and **`fixedprice`**.
 2. **GET /activity** — pick **`activity.id`** matching the task (billable / named activity; use **`/activity/>forTimeSheet`** or **`/project/>forTimeSheet`** filters per Swagger if list search is ambiguous).
-3. **POST /timesheet/entry** — **separate POST for each** employee / date / hours combination the prompt specifies (**project**, **activity**, **employee**, **date**, **hours**).
+3. **POST /timesheet/entry** — **separate POST for each** employee / date / hours combination the prompt specifies (**project**, **activity**, **employee**, **date**, **hours**). **Per calendar `date`, `hours` ≤ 24** (realistic day); **French** *enregistrer le temps* / **weekly** totals → **split across days** — **`execute_tool`** **rejects** **`hours` > 24** without HTTP (see **CRITICAL** below).
    - **CRITICAL — `hours` sanity:** For **one calendar `date`**, **`hours` must be ≤ 24** (realistic day work **≤ ~12**). **French / EU decimal comma:** **5,5 h** in the task means **JSON `5.5`**, **not** **`55`** or **`57`**. If amounts look like **weekly** totals, **split by day** per the prompt or use **daily** hours stated — **never** post **57** or **99** for a **single** **`date`** unless the task **explicitly** says so (e.g. aggregate across **multiple** entries).
-4. If the task requests **invoice** / **faktura** / **fakturere** / **:invoice**: follow **Create invoice** or **Invoice from a project** (**1920** only when **`:invoice`** applies — see **WHEN TO SKIP**): **`POST /order`** (often with **`project: {id}`**) → **`PUT /order/{id}/:invoice`** → **`PUT /invoice/{id}/:send`** if send wording appears.
+4. If the task requests **invoice** / **faktura** / **fakturere** / **Fature** / **facturar** / **:invoice**: follow **Create invoice** or **Invoice from a project** (**1920** only when **`:invoice`** applies — see **WHEN TO SKIP**): **`POST /order`** (often with **`project: {id}`**) → **`PUT /order/{id}/:invoice`** → **`PUT /invoice/{id}/:send`** if send wording appears.
 
 **Do not `end_turn` until ALL steps the user mentioned in this category are completed** (project + fixed price if budget + every stated timesheet row + order/invoice/send if requested). Partial runs fail checks and efficiency.
 
 Log hours (timesheet entry):
 **Employee id:** from **Create employee Step 0** (**`GET /employee?email=X&fields=id,firstName,lastName`**) when the person already exists — **do not** **POST /employee** and hit duplicate-email **422**. If Step **0** is empty, create via Step **2** first.
 GET /project?name=X&fields=id,name → project id
-GET /activity?name=X&fields=id,name → activity id (**`fields`:** **no** **isInactive** — invalid **ActivityDTO** filter → **400**; **id**, **name**, **activityNumber** OK per Swagger)
+GET /activity?name=X&fields=id,name → activity id (**`fields`:** **no** **isInactive** or **activityNumber** — Tripletex **400** *Illegal field* on **ActivityDTO** list/detail; **`execute_tool`** strips them)
 POST /timesheet/entry {
   project: {id},
   activity: {id},
@@ -1844,6 +1965,7 @@ Confirmed field names (live testing) — **do not** guess **`name`** / **`value`
 - **Step 2 —** **POST** `/ledger/accountingDimensionValue` with **`{"displayName": "Value1"}`** (NOT **`value`** or **`name`**) → note **value** **id₁**.
 - **Step 3 —** **POST** `/ledger/accountingDimensionValue` with **`{"displayName": "Value2"}`** → note **value** **id₂** (repeat for more values).
 - **Step 4 —** Create the journal with **`tripletex_post_voucher`** (see below). On each line that needs a dimension, set **`freeAccountingDimension1: {"id": VALUE_ID}`** (**VALUE_ID** = **`id`** from **POST** **`/ledger/accountingDimensionValue`** in steps 2/3). You may also write **`accountingDimensionValues: [{"id": VALUE_ID}]`** in the tool — **`execute_tool`** maps it to **`freeAccountingDimension1`** (Tripletex **Posting** rejects **`accountingDimensionValues`** on **POST /ledger/voucher** — *feltet eksisterer ikke*).
+- **German (DE) / wording:** **Buchhaltungsdimension**, **benutzerdefinierte Dimension**, **Dimensionswert** / **Werte**, **Kostsenter** / **Kostenstelle**, **Beleg … buchen** / **verbuchen** → this section. **Ein Beleg** + **one** amount + **one** named **Dimensionswert** → **one** balanced voucher; put **`freeAccountingDimension1`** on the **debit** (expense) line the prompt ties to the centre. **Creating multiple** **`POST /ledger/accountingDimensionValue`** rows does **not** force **multiple** vouchers — only if the prompt asks **per** value (**je**, **jeweils**, **für jeden Wert**, **separate** entries) or gives **separate** amounts.
 
 **CRITICAL — custom dimension + manual journal (competition **Task ~06** pattern):**
 - **Two different GL `account.id` values** — **never** debit and credit the **same** account (e.g. **7000** **`amountGross` +30250** and **7000** **−30250**). That is not a valid expense entry; Tripletex often **422**s one-step voucher create and you waste turns. **`GET /ledger/account?number=NNNN&fields=id,number,name`** for the **debit** GL the task names (**7000**, **6xxx**, …) **and** for a **real** **credit** target: **2900**-class (*forskudd/gjeld*), **2400** (*leverandørgjeld* + **`supplier`** if required), **1500** (*kundefordringer* + **`customer`** if required), **2740** (*MVA*), or another **non-bank** account the prompt states.
@@ -1857,7 +1979,7 @@ Other lookups ( explore Swagger + **GET** **`fields`** before **POST** ):
 - **GET** `/ledger/account`, **GET** `/department` — accounts and departments for postings
 - **GET** `/project/orderline` [BETA] — if the task ties amounts to project lines
 
-**Month-end / accruals (*periodisering*, *avskrivning*, *clôture*, year-end tax):** **Prepaid / forskudd** → **Dr** expense matching substance (**6xxx** *leie/lokale* from **`GET` by number**), **Cr** the prepayment account the task names — **not** **7140**/travel or **5000**/lønn unless the task says so. **Depreciation:** **`GET` each stated asset GL** (**1250**, **1210**, …) for **credit** (−**amountGross**); **Dr** **6020**/software, **6010**/vehicles, or task-named expense — **do not** default **1290** for every asset. **Tax accrual:** **Dr** *skattekostnad* (**8300** or **`GET` by name**), **Cr** tax-payable **gjeld** (**2500**/**2540**/**2900**-class) — **not** **8990**/**2920** unless named.
+**Month-end / accruals (*periodisering*, *avskrivning*, *clôture*, *depreciação*, year-end tax):** **Prepaid / forskudd / leie** → **Dr** **6300** (*Leie lokale*) or another **6xxx** *leie/lokale* **`GET` by number** — **not** **6000** (*avskrivning på bygninger*) for ordinary **lease** reversal unless the task names **6000**; **not** **7140**/travel or **5000**/lønn unless the task says so. **Cr** the prepayment account named (**1700**, …). **Depreciation:** for **each** asset, **`GET /ledger/account?number=<exact task GL>&fields=id,number,name`** and use that **`id`** on the **credit** (−**amountGross**) line — returned **`number`** must match (**1250** vs **1240** *traktor*); **do not** swap asset accounts. **Dr** expense per type — **`GET` 6010/6020/6540**: if **6010**’s **`name`** is **only** *transport* / *kjøretøy*, **do not** use it for **programvare** / **IT** — use **6020**/**6540**. **Tax accrual (22% etc.):** **Dr** **8300**, **Cr** **2500** (*betalbar skatt*) — **`GET` those numbers** — **never** **2920** (*gjeld … samme konsern*) for corporate tax provision; **never** post **all-zero** lines — compute NOK from the **profit/base the task states**; **`send_to_ledger: true`** when booking.
 
 Book expense from receipt (kvittering / **bilag fra PDF**) — **Task 22 pattern** (**togbillett**, **train ticket**, **receipt PDF**, **bokfør utgift**, **kvittering**, **department** + **MVA**):
 When the task is to **book** a **purchase** from an **attached PDF receipt** on the **general ledger** (manual journal — **not** the full **POST /travelExpense** + **POST /travelExpense/cost** flow unless the prompt explicitly asks for a **travel report**), follow this path:
@@ -1876,7 +1998,7 @@ When the task is to **book** a **purchase** from an **attached PDF receipt** on 
 
 **Do not** `end_turn` after only **GET**s — **`tripletex_post_voucher`** must run when the user asked to **bokfør** from the receipt.
 
-Create ledger voucher (bilagsføring) — **always** call **`tripletex_post_voucher`** (**never** **`tripletex_post`** on **`/ledger/voucher`** — the tool is blocked). Swagger [v2-docs](https://tripletex.no/v2-docs/) documents **`postings`** (plural). **422** responses are logged in **full** before retries — they are often **`VALIDATION_ERROR`**: *«Kunde mangler»* (**`postings.customer.id`**), *«Summen av posteringene … er ikke lik 0»*, or *uten posteringer*; fix the **posting** data (balance, **`customer`** on debits when AP has **`supplier`**, distinct GL accounts), not only the HTTP shape. The tool retries **no `sendToLedger` query**, singular **`posting`**, **hybrid** first-line inline + **`/postings`**, then **empty** shell + per-line **`/postings`**. Do **not** hand-craft **`rows`**. **One-step first** when inline postings are accepted.
+Create ledger voucher (bilagsføring) — **always** call **`tripletex_post_voucher`** (**never** **`tripletex_post`** on **`/ledger/voucher`** — the tool is blocked). Swagger [v2-docs](https://tripletex.no/v2-docs/) documents **`postings`** (plural). **422** responses are logged in **full** before retries — they are often **`VALIDATION_ERROR`**: *«Kunde mangler»* (**`postings.customer.id`**), *«Leverandør mangler»* on **2400**/**leverandørgjeld** (**put **`supplier:{id}`** on that **credit** line**), *«låst til mva-kode 0»* (**remove **`vatType:1`** from that **account** — pick another **6xxx** debit or use **net + 2710** split), *«Summen av posteringene … er ikke lik 0»*, or *uten posteringer*; fix the **posting** data (balance, **`customer`** on debits when AP has **`supplier`**, distinct GL accounts), not only the HTTP shape. The tool retries **no `sendToLedger` query**, singular **`posting`**, **hybrid** first-line inline + **`/postings`**, then **empty** shell + per-line **`/postings`**. Do **not** hand-craft **`rows`**. **One-step first** when inline postings are accepted.
 
 **CRITICAL:** Never use **bank accounts** (**`isBankAccount: true`**, accounts like **1920**, **1910**, etc.) as posting lines in **`tripletex_post_voucher`**. Tripletex **rejects** manual postings to **reconciliation** accounts. For **cash/bank** movements use **payment actions** (`/:payment`, `/:addPayment`) instead.
 
@@ -1899,29 +2021,30 @@ Search vouchers:
 GET /ledger/voucher?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD&fields=id,date,description,number
 CRITICAL: **dateFrom** and **dateTo** are required. **dateTo** must be **strictly after** **dateFrom**. **Voucher** list **`fields`**: **`number`** = bilagsnummer — **illegal**: **`voucherNumber`**, **`amount`** on **`VoucherDTO`** (**400**). Line amounts → **`postings`** on **`GET /ledger/voucher/{id}`** only.
 
-Ledger audit / error correction: When the task asks to **fix** voucher/ledger errors, **finish** with **`tripletex_post_voucher`** — **never** only **`tripletex_get`**. **List** **`GET /ledger/voucher`** with **`dateFrom`/`dateTo`**, **`fields=id,date,description,number`** (no heavy **`postings`** on list — paginate). **Detail** **`GET /ledger/voucher/{id}`** for suspects (tool expands **`postings(...)`**). Map task hints to **`voucher.id`** + lines; **correct** via **mirror-reverse** wrong lines + repost right **`account.id`**; **balance** sum **`amountGross`=0**; **`send_to_ledger: true`** when expected.
+Ledger audit / error correction: When the task asks to **fix** voucher/ledger errors, **finish** with **`tripletex_post_voucher`** — **never** only **`tripletex_get`**. **List** **`GET /ledger/voucher`** with **`dateFrom`/`dateTo`**, **`fields=id,date,description,number`** (no heavy **`postings`** on list — paginate). **Detail** **`GET /ledger/voucher/{id}`** for suspects (tool expands **`postings(...)`**). Map task hints to **`voucher.id`** + lines; **correct** via **mirror-reverse** wrong lines + repost right **`account.id`**; **balance** sum **`amountGross`=0**; **`send_to_ledger: true`** when expected. **Reversing** a line that hit **1920** on the original: **do not** put **1920** on the **correction** voucher — **`tripletex_post_voucher`** **blocks** bank lines; use **2900** (*Forskudd fra kunder*) or another **non-bank** clearing (**`GET /ledger/account?number=2900`**) as the offset for **duplicate** / **mirror-reverse** corrections.
 
-If a tool result shows **403** (e.g. **"Invalid or expired token"**): treat as **infrastructure** / proxy expiry — you still **continue** with every remaining call you planned (**try all departments**, all POSTs, etc.). The token may work again on the next request. **Do not** stop the whole task after the first 403. For a new submission, the platform must supply a **fresh** session_token; frequent 403s → **organisers** (Slack), not something you fix by tweaking JSON alone.
+If **403** **`details`** include **nmiai-proxy** + **Invalid or expired proxy token**: **stop** assuming the run can succeed — **do not** use placeholder **`account:{id}`** values; **do not** claim completion. **Otherwise**, **403** may be transient — **continue** with remaining planned calls. **Fresh** `session_token` per **new** submission; frequent proxy failures → **organisers**.
 
 Do **not** give up on the first turn for unfamiliar wording: map the task to Tripletex resources, **GET** to discover ids/shape, then **POST**/**PUT** with minimal verified calls.
 
-**Travel expense:** OpenAPI — trip fields live under **`travelDetails`** on **`POST /travelExpense`** (**departureDate**, **returnDate**, **destination**, **purpose**, …). Then **`POST /travelExpense/perDiemCompensation`** only for **TRAVEL**-type per diem. **Cost lines:** **`POST /travelExpense/cost`** per receipt line — **`amountCurrencyIncVat`**, **`amountNOKInclVAT`**, **`comments`** (not *description*), **`paymentType:{id}`** from **`GET /travelExpense/paymentType?fields=id`**, **`costCategory:{id}`** (list rows are enriched from **`GET /travelExpense/costCategory/{id}`** in **`tripletex_get`** — reuse ids). **`vatType`:** often **{id:1}** for paid domestic costs, **{id:0}** for diett/per diem — align with category + prompt. See Swagger for full **TravelExpense** / **TravelExpenseCost** shapes.
+**Travel expense:** OpenAPI — trip fields live under **`travelDetails`** on **`POST /travelExpense`**. **Do not** put **`paymentType`** on the **travel expense shell** (422 *Feltet eksisterer ikke i objektet*) — **`paymentType`** goes on **`POST /travelExpense/cost`** only. **Shell `type`:** numeric or omit — string **TRAVEL** 422s (*Verdien er ikke av korrekt type*); runtime maps **TRAVEL** → **0**. Then **`POST /travelExpense/perDiemCompensation`**; if **422** *Country not enabled for travel expense*, retry **minimal** body (**travelExpense**, **count**, **rate**, **amount**, **location**). **Cost lines:** **`POST /travelExpense/cost`** — **`amountCurrencyIncVat`**, **`amountNOKInclVAT`**, **`comments`**, **`paymentType:{id}`**, **`costCategory:{id}`**. **`vatType`:** often **{id:1}** for paid domestic costs, **{id:0}** for diett/per diem.
 
 Run payroll (lønn):
 Step 0 — **Active employment + division** (always before **POST /salary/transaction**):
 - **tripletex_get** **`GET /employee/{employeeId}?fields=id,dateOfBirth`** — if **`dateOfBirth`** **null**, **PUT /employee/{id}** **`dateOfBirth`** (prompt or **`1990-01-01`**) **before** creating employment (see Create employee Step 3).
 - **tripletex_get** **`GET /employee/employment?employeeId={employeeId}&fields=id,startDate,division`**
-- If **`values`** is **empty** / no row: **POST /employee/employment** **`{employee, startDate}`** (runtime tries **`division:{id:1..3}`** on **POST** before minimal — see **Create employee Step 3**). Then **GET** again; if **`division`** still **null**, **Step 4** **PUT** **`division`** (**PUT** **`1`**; **403** → **2**, **3**; **422** *«Virksomheten…»* → **stop**).
-- If a row exists but **`division`** is **null**: run **Step 4** **`PUT`** sequence (same **422** rule).
+- If **`values`** is **empty** / no row: **POST /employee/employment** **`{employee, startDate}`** (runtime tries **`division:{id:1..N}`** on **POST** before minimal — **Create employee Step 3**). Then **GET** again; if **`division`** still **null**, **Step 4** **PUT** **`division`** **1**, **2**, **3** (retry next **id** after **422** *«Virksomheten…»* for a specific **id**).
+- If a row exists but **`division`** is **null**: run **Step 4** **`PUT`** sequence (same rule).
 Step 0b — **EmploymentDetails** (if task states **% stilling** / **årslønn**): **Create employee Step 3b** — **`POST /employee/employment/details`** with **`employment:{id}`**, **`date`**, **`percentageOfFullTimeEquivalent`**, **`annualSalary`** / **`monthlySalary`** before **salary transaction**.
 Step 1 — **GET /salary/type** — use **`fields=id,name`** only (**`displayName`** **400**; **`TripletexAPI.get`** strips it). Pick **Fastlønn** / **Timelønn** **`id`** from **`values`**.
 Step 2 — **tripletex_post** **POST /salary/transaction** with **`params`** **`{generateTaxDeduction: true}`** and body **`{date, year, month, payslips:[{employee:{id}, specifications:[{salaryType:{id}, amount, count:1, rate: same as amount}, …]}]}`** — each spec line needs **`count`** + **`rate`** (agent may auto-fill from **`amount`**).
+CRITICAL: **`year`** / **`month`** must be a payroll period where the employee already has an **active employment** per **`GET /employee/employment`** (**422** *«ikke registrert med et arbeidsforhold i perioden»* if **`startDate`** is **after** that month or missing). **«This month»** / **este mes** / **denne måneden** without a calendar: align **`year`/`month`** with **`startDate`** (or set **`startDate`** to the **first day** of the month you pay) — **do not** invent an earlier **year**/**month** that predates **`startDate`**. **422** *Ugyldig år*: the **year** may be **closed** on the tenant — try an **open** competition year (**2026**) with **`month`** matching the task, not stale **2024**/**2025** guesses.
 CRITICAL: Use **POST /salary/transaction** for creation (not /salary or /payroll).
 CRITICAL: **/salary/payslip** and **/salary/compilation** are read-only in this flow — do not use them to create payroll data.
-CRITICAL: If salary POST returns **arbeidsforhold** / **virksomhet** errors after Step 4, **do not** issue more **`PUT`** **`division`** if **422** *«Virksomheten kan ikke endres»* already occurred — **runtime may block** further division **PUT**s.
+CRITICAL: If salary POST returns **«ikke knyttet mot en virksomhet»**, **`GET /employee/employment/{id}?fields=id,division`** and **`PUT`** another **division** **id** if **`division`** is still **null** — **do not** use **`tripletex_delete`** on **`/employee/employment/{id}`** (often **405**; **`execute_tool`** **skips** that **DELETE**). If **`PUT` division** was **skipped** (**`minimalFallbackDivisionPutSkipped`**), payroll may be **blocked** on that tenant — **do not** **DELETE** employment. **Do not** create a **second** overlapping **`POST /employee/employment`** with the same **`startDate`** (422 *Overlappende perioder*).
 
 Delete resource:
-  DELETE /{resource}/{id}
+  DELETE /{resource}/{id} — **not** **`/employee/employment/{id}`** (API **405**); use **`tripletex_delete`** only for paths the tenant allows.
 
 GET tips:
   - **Invoice lists**: always pass invoiceDateFrom + invoiceDateTo + customerId (if known) + fields=id,invoiceNumber,invoiceDate,amountExcludingVat — never request invalid field names (isPaid, dueDate, amountIncludingVat, paid)
@@ -2181,6 +2304,37 @@ def _employee_list_empty_email_error(path: str, params: Optional[dict[str, Any]]
     return None
 
 
+def _salary_transaction_422_tool_note(status: int, detail: str, tool_name: str, inp: dict[str, Any]) -> Optional[str]:
+    """Extra guidance when **POST /salary/transaction** returns validation errors (competition tenants)."""
+    if tool_name != "tripletex_post" or status != 422:
+        return None
+    p = urlparse((inp or {}).get("path") or "").path.rstrip("/")
+    if p != "/salary/transaction":
+        return None
+    d = (detail or "").lower()
+    parts: list[str] = []
+    if "ugyldig" in d and "år" in d:
+        parts.append(
+            "**Ugyldig år:** payroll **year** may be closed or not enabled — use an **open** year "
+            "(**2026** is typical for NM i AI when the task says *this month* / *este mes* without a calendar year). "
+            "Align **`year`**, **`month`**, and **`date`**; **`employment.startDate`** must be on or before the payslip month."
+        )
+    if "virksomhet" in d or "knyttet mot en virksomhet" in d:
+        parts.append(
+            "**Employment `division` is null** — **`POST /salary/transaction`** requires **virksomhet**. "
+            "If **`PUT` division** was **skipped** (**`minimalFallbackDivisionPutSkipped`** after **POST /employee/employment**), "
+            "**do not** **`tripletex_delete`** **`/employee/employment/{id}`** (often **405**). "
+            "**Do not** **POST** a second overlapping employment with the same **startDate** (422 *Overlappende perioder*)."
+        )
+    return " ".join(parts) if parts else None
+
+
+def _nmiai_proxy_expired_token_detail(detail: str) -> bool:
+    """True when the competition proxy rejects the whole submission (not a Tripletex validation error)."""
+    d = (detail or "").lower()
+    return "nmiai-proxy" in d or "invalid or expired proxy token" in d
+
+
 def _reject_manual_voucher_bank_lines(
     api: "TripletexAPI", postings_lines: list[Any]
 ) -> Optional[dict[str, Any]]:
@@ -2360,9 +2514,31 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                 body_out = _enrich_salary_transaction_body(dict(body_out))
             if path_only == "/order":
                 body_out = _enrich_order_post_body(dict(body_out))
+            if path_only == "/travelExpense":
+                body_out = _enrich_travel_expense_post_body(dict(body_out))
             post_params = inp.get("params")
             if post_params is not None and not isinstance(post_params, dict):
                 post_params = None
+            if path_only == "/employee":
+                em_post = body_out.get("email")
+                if not (isinstance(em_post, str) and em_post.strip()):
+                    _agent_print(
+                        "  ℹ️  POST /employee — **email** missing or empty — skipped (would 422 *Må angis for Tripletex-brukere*)."
+                    )
+                    return json.dumps(
+                        {
+                            "error": (
+                                "POST /employee: **email** must be a non-empty string — Tripletex requires it for **userType** **STANDARD** "
+                                "(*Må angis for Tripletex-brukere*). Read the PDF/offer letter for the hire's **email**, then POST with "
+                                "that exact value — same as Step 0 **GET /employee?email=…**."
+                            ),
+                            "_toolNote": (
+                                "If **GET /employee** was blocked for empty **email**, do not **POST** without **email** — extract **email** "
+                                "from the attachment first."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
             if path_only == "/supplierInvoice":
                 fp0 = _supplier_invoice_body_fingerprint(body_out)
                 bk0 = getattr(api, "supplier_invoice_500_seen", None)
@@ -2375,7 +2551,73 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                             "skipped": True,
                             "_toolNote": (
                                 "Duplicate POST /supplierInvoice blocked for this invoiceNumber+supplier (already HTTP 500 code 1000). "
-                                "Use tripletex_post_voucher — expense + inngående MVA + 2400 with supplier on the credit line."
+                                "Use tripletex_post_voucher — expense (6xxx that accepts vatType 1, or net+2710) + credit 2400 with supplier:{id}."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+            if path_only == "/activity":
+                at_raw = body_out.get("activityType")
+                ok_at = (
+                    (isinstance(at_raw, dict) and at_raw.get("id") is not None)
+                    or (isinstance(at_raw, str) and at_raw.strip() != "")
+                )
+                if not ok_at:
+                    _agent_print(
+                        "  ℹ️  POST /activity — body missing **activityType** — skipped (would 422)."
+                    )
+                    return json.dumps(
+                        {
+                            "error": (
+                                "POST /activity requires activityType — use {id: N} or a string enum "
+                                "from GET /activity (e.g. GENERAL_ACTIVITY, PROJECT_GENERAL_ACTIVITY). "
+                                "GET /activityType may 404 on this tenant — do not rely on it alone."
+                            ),
+                            "_toolNote": (
+                                "Tripletex: activityType cannot be null on POST /activity — "
+                                "include activityType:{id} or the enum string from GET /activity rows."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+            if path_only == "/project":
+                pm_raw = body_out.get("projectManager")
+                ok_pm = isinstance(pm_raw, dict) and pm_raw.get("id") is not None
+                if not ok_pm:
+                    _agent_print(
+                        "  ℹ️  POST /project — body missing **projectManager.id** — skipped (would 422 Prosjektleder)."
+                    )
+                    return json.dumps(
+                        {
+                            "error": (
+                                "POST /project requires projectManager: {id} and startDate. "
+                                "GET /employee?fields=id,firstName,lastName,email first (task-named PM or suitable employee)."
+                            ),
+                            "_toolNote": (
+                                "Tripletex requires project manager on project create — add projectManager before HTTP."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+            if path_only == "/timesheet/entry":
+                h_raw = body_out.get("hours")
+                try:
+                    h = float(h_raw) if h_raw is not None else None
+                except (TypeError, ValueError):
+                    h = None
+                if h is not None and h > 24:
+                    _agent_print(
+                        "  ℹ️  POST /timesheet/entry — **hours** > 24 for one **date** — skipped (unrealistic day / grader)."
+                    )
+                    return json.dumps(
+                        {
+                            "error": (
+                                "POST /timesheet/entry: for one calendar date, hours must be ≤ 24 — split weekly totals "
+                                "across multiple dates or use per-day hours from the task (SYSTEM_PROMPT — full project lifecycle)."
+                            ),
+                            "_toolNote": (
+                                "Use several POST /timesheet/entry calls with different date values; "
+                                "do not put a whole week’s hours on a single date."
                             ),
                         },
                         ensure_ascii=False,
@@ -2384,16 +2626,21 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                 if path_only == "/employee/employment":
                     seq = _employment_post_attempt_sequence(body_out)
                     if len(seq) > 1:
+                        _div_try = _employment_division_post_ids()
+                        _hi = _div_try[-1] if _div_try else 7
                         _agent_print(
-                            "  ℹ️  POST /employee/employment: try **division:{id:1..3}** on create; "
-                            "each **HTTP 404** → next id, then minimal `{employee, startDate}`."
+                            f"  ℹ️  POST /employee/employment: try **division:{{id:1..{_hi}}}** on create; "
+                            "each **HTTP 404** or **422** (division/virksomhet in body) → next id, "
+                            "then minimal `{employee, startDate}`."
                         )
                     result: Optional[dict[str, Any]] = None
                     last_err: Optional[requests.HTTPError] = None
+                    win_bod: Optional[dict[str, Any]] = None
                     for idx, bod in enumerate(seq):
                         try:
                             result = api.post(path, bod, params=post_params)
                             last_err = None
+                            win_bod = bod
                             break
                         except requests.HTTPError as e:
                             last_err = e
@@ -2402,6 +2649,15 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                                 resp is not None
                                 and resp.status_code == 404
                                 and idx + 1 < len(seq)
+                            ):
+                                continue
+                            if (
+                                resp is not None
+                                and resp.status_code == 422
+                                and idx + 1 < len(seq)
+                                and isinstance(bod.get("division"), dict)
+                                and bod["division"].get("id") is not None
+                                and _employment_post_422_division_related(resp.text or "")
                             ):
                                 continue
                             if (
@@ -2416,6 +2672,7 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                                     try:
                                         result = api.post(path, minimal, params=post_params)
                                         last_err = None
+                                        win_bod = minimal
                                         break
                                     except requests.HTTPError as e2:
                                         last_err = e2
@@ -2424,23 +2681,13 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                         raise last_err
                     if result is None:
                         raise RuntimeError("POST /employee/employment: no result after attempt sequence")
+                    if win_bod is not None:
+                        _record_employment_post_minimal_division_fallback(
+                            api, body_out, win_bod, result
+                        )
                 else:
                     result = api.post(path, body_out, params=post_params)
             except requests.HTTPError as e:
-                if (
-                    path_only == "/salary/transaction"
-                    and e.response is not None
-                    and e.response.status_code == 422
-                ):
-                    err_txt = e.response.text or ""
-                    if (
-                        "ikke knyttet mot en virksomhet" in err_txt
-                        or "Arbeidsforholdet er ikke knyttet" in err_txt
-                    ):
-                        _lock_employments_for_employees(
-                            api,
-                            _employee_ids_from_salary_transaction_body(body_out),
-                        )
                 if (
                     path_only == "/supplierInvoice"
                     and e.response is not None
@@ -2464,8 +2711,9 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                                 "_toolNote": (
                                     "POST /supplierInvoice returned HTTP 500 code 1000 (no validation detail) on this tenant. "
                                     "Do NOT call tripletex_post /supplierInvoice again for this invoiceNumber+supplier — "
-                                    "the runtime will block duplicates. Use tripletex_post_voucher now: debit expense (+ vatType 1 if one-line VAT), "
-                                    "debit/credit 2710 split if you use separate VAT line, credit 2400 with supplier:{id} on AP line."
+                                    "the runtime will block duplicates. Use tripletex_post_voucher: debit a **6xxx** expense that "
+                                    "accepts **vatType:1** (not **7100/7140** if locked to VAT 0 — use **6800/7300** or net+**2710** split), "
+                                    "credit **2400** with **supplier:{id}** on the AP line (*Leverandør mangler* if missing)."
                                 ),
                             },
                             ensure_ascii=False,
@@ -2505,19 +2753,67 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
             if not isinstance(body, dict):
                 body = {}
             eid = _employment_id_from_path(path)
+            div_put = _division_id_from_employment_put_body(body)
+            _div_rej = _employment_division_put_rejected.get(eid, set()) if eid is not None else set()
+            _mf_ids = getattr(api, "employment_post_minimal_fallback_ids", None)
             if (
                 eid is not None
-                and body.get("division") is not None
-                and eid in _employment_division_locked_ids
+                and div_put is not None
+                and _mf_ids is not None
+                and eid in _mf_ids
             ):
                 return json.dumps(
                     {
                         "skipped": True,
                         "reason": (
-                            "PUT division blocked: this employment already got 422 «Virksomheten kan ikke endres». "
-                            "Do not retry division 2/3. Continue with POST /salary/transaction or stop if tenant blocks payroll."
+                            "POST /employee/employment only succeeded with `{employee,startDate}` after division ids 1..N "
+                            "failed on create — PUT division usually returns «Virksomheten kan ikke endres» here; skipped HTTP."
                         ),
                         "employmentId": eid,
+                        "minimalFallbackDivisionPutSkipped": div_put,
+                        "_toolNote": (
+                            "Do not retry PUT division for this employment. **GET** **/employee/employment/{id}?fields=id,division** — "
+                            "if **division** is **null**, HR onboarding may still be complete (**department** on **POST /employee**). "
+                            "For salary POSTs that require virksomhet, escalate per task; do not burn iterations on PUT division."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            # NM tenants often reject PUT division for 1, 2, and 3 identically — skip the third HTTP 422 when 1+2 already failed.
+            if (
+                eid is not None
+                and div_put == 3
+                and 1 in _div_rej
+                and 2 in _div_rej
+            ):
+                return json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": (
+                            "PUT division id 1 and id 2 both returned 422 «Virksomheten kan ikke endres» — "
+                            "skipped HTTP for id 3 to save efficiency. "
+                            "GET /employee/employment/{id}?fields=id,division before salary if needed."
+                        ),
+                        "employmentId": eid,
+                        "divisionIdSkipped": 3,
+                    },
+                    ensure_ascii=False,
+                )
+            if (
+                eid is not None
+                and div_put is not None
+                and div_put in _div_rej
+            ):
+                return json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": (
+                            f"PUT division {{id:{div_put}}} already returned 422 «Virksomheten kan ikke endres» "
+                            f"for employment {eid} — try **another** division **id** (e.g. 2 or 3 if you only tried 1), "
+                            "or **GET /employee/employment/{{id}}?fields=id,division** before salary."
+                        ),
+                        "employmentId": eid,
+                        "divisionId": div_put,
                     },
                     ensure_ascii=False,
                 )
@@ -2529,9 +2825,9 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                     if (
                         "Virksomheten kan ikke endres" in detail
                         and eid is not None
-                        and body.get("division") is not None
+                        and div_put is not None
                     ):
-                        _employment_division_locked_ids.add(eid)
+                        _employment_division_put_rejected.setdefault(eid, set()).add(div_put)
                 raise
             return json.dumps(result, ensure_ascii=False)
 
@@ -2550,7 +2846,26 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
             return json.dumps(result, ensure_ascii=False)
 
         elif name == "tripletex_delete":
-            result = api.delete(inp["path"])
+            del_path = str(inp.get("path") or "")
+            if _employment_id_from_path(del_path) is not None:
+                _agent_print(
+                    "  ℹ️  DELETE /employee/employment/{id} — skipped (API returns **405** — not supported)."
+                )
+                return json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": (
+                            "DELETE /employee/employment/{id} is not supported on Tripletex (HTTP 405) — skipped HTTP."
+                        ),
+                        "_toolNote": (
+                            "Do **not** delete employment to fix payroll. Use **GET /employee/employment?employeeId=…**; "
+                            "if **division** is **null** and **PUT** was skipped (**minimalFallbackDivisionPutSkipped**), "
+                            "salary may be blocked on this tenant pattern."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            result = api.delete(del_path)
             return json.dumps(result)
 
         return json.dumps({"error": f"Unknown tool: {name}"})
@@ -2561,13 +2876,33 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
         # 403 is usually competition proxy / token expiry (infra); still surface to the model but don't frame like a careless 422
         if 400 <= status < 500:
             if status == 403:
-                _agent_print(f"  ℹ️  HTTP 403 on {name} — often expired proxy token (infra). Model should continue remaining planned calls.")
+                if _nmiai_proxy_expired_token_detail(detail):
+                    _agent_print(
+                        f"  ℹ️  HTTP 403 on {name} — **nmiai-proxy** invalid/expired token (this submission). "
+                        "See **_toolNote** in tool result — do not invent ledger **account** ids or claim success."
+                    )
+                else:
+                    _agent_print(
+                        f"  ℹ️  HTTP 403 on {name} — often expired proxy token (infra). Model should continue remaining planned calls."
+                    )
             else:
                 _agent_print(f"  ⚠️  4xx ERROR ({status}) on {name} — costs efficiency bonus!")
-        return json.dumps({
-            "http_error": status,
-            "details":    detail,
-        })
+        err_payload: dict[str, Any] = {"http_error": status, "details": detail}
+        if status == 403 and _nmiai_proxy_expired_token_detail(detail):
+            err_payload["_toolNote"] = (
+                "**nmiai-proxy:** the **session_token** for **this submission** is invalid or expired — Tripletex will not "
+                "accept calls until the platform issues a **fresh** token for a **new** submission. "
+                "**Never** invent **`account:{id:1}`**, **`{id:2}`**, or other placeholder GL **id**s — resolve real **id**s with "
+                "**`GET /ledger/account?number=NNNN&fields=id,number,name`** only when the API returns **200**. "
+                "**Do not** end the task as successfully completed if **GET**/**POST** keep returning this **403**."
+            )
+        sal_note = _salary_transaction_422_tool_note(status, detail, name, inp if isinstance(inp, dict) else {})
+        if sal_note:
+            prev = err_payload.get("_toolNote")
+            err_payload["_toolNote"] = (
+                f"{prev} {sal_note}".strip() if isinstance(prev, str) and prev.strip() else sal_note
+            )
+        return json.dumps(err_payload)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -2592,7 +2927,7 @@ def _pdf_employee_context_hint(files: list[FileAttachment], prompt: str) -> Opti
             "hire",
             "payroll",
             "salary",
-            # French offer-letter / HR PDF tasks
+            # French offer-letter / HR PDF tasks (accented + ASCII — `w in p` is literal)
             "embauche",
             "employé",
             "employe",
@@ -2600,6 +2935,8 @@ def _pdf_employee_context_hint(files: list[FileAttachment], prompt: str) -> Opti
             "contrat",
             "intégration",
             "integration",
+            "lettre",
+            "offre",
         )
     ):
         return None
@@ -2632,18 +2969,23 @@ def _pdf_supplier_invoice_context_hint(files: list[FileAttachment], prompt: str)
         for w in (
             "fatura",
             "factura",
+            "facture",  # FR (not "factura")
             "faktura",
             "invoice",
             "registe",
             "registrar",
             "registrer",
+            "enregistrez",
+            "enregistrer",
+            "enregistr",
         )
     )
     if not (supplierish and invoiceish):
         return None
     return (
         "[PDF + leverandørfaktura] Les PDF for leverandørnavn, org.nr., fakturanummer, dato, beløp inkl. MVA og kostnadstype. "
-        "Opprett leverandør (GET orgnr → POST/PUT isCustomer:false). Hvis POST /supplierInvoice gir HTTP 500 kode 1000: "
+        "Opprett leverandør (GET orgnr → POST isSupplier:true; én GET+PUT-syklus hvis isCustomer forblir true, deretter fortsett). "
+        "Hvis POST /supplierInvoice gir HTTP 500 kode 1000: "
         "ikke gjenta samme POST — bruk tripletex_post_voucher (kostnad + 2710 inngående + 2400 med supplier på kreditlinjen)."
     )
 
@@ -2761,6 +3103,7 @@ def run_agent(prompt: str, api: TripletexAPI, files: list[FileAttachment]) -> No
         # Execute tool calls
         tool_results: list[dict] = []
         saw_403 = False
+        saw_nmiai_proxy_dead = False
         for block in response.content:
             if block.type != "tool_use":
                 continue
@@ -2774,6 +3117,8 @@ def run_agent(prompt: str, api: TripletexAPI, files: list[FileAttachment]) -> No
                 parsed = json.loads(result)
                 if parsed.get("http_error") == 403:
                     saw_403 = True
+                    if _nmiai_proxy_expired_token_detail(str(parsed.get("details") or "")):
+                        saw_nmiai_proxy_dead = True
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
 
@@ -2784,7 +3129,19 @@ def run_agent(prompt: str, api: TripletexAPI, files: list[FileAttachment]) -> No
             })
 
         follow_up: list[dict] = list(tool_results)
-        if saw_403:
+        if saw_nmiai_proxy_dead:
+            follow_up.append({
+                "type": "text",
+                "text": (
+                    "Infrastructure note: At least one tool result was HTTP **403** from **nmiai-proxy** "
+                    "(*Invalid or expired proxy token*). That means the **session_token** for **this submission** is dead — "
+                    "**repeating** the same calls will **not** fix it. **Do not** end_turn as if vouchers or year-end postings "
+                    "**succeeded**. **Do not** use placeholder **`account:{id:1}`** / **`{id:2}`** — those are not real GL accounts. "
+                    "For a **new** grader run, the platform must supply a **fresh** token. (If you only saw **one** isolated 403 "
+                    "without this proxy message, you may still complete remaining planned calls.)"
+                ),
+            })
+        elif saw_403:
             follow_up.append({
                 "type": "text",
                 "text": (

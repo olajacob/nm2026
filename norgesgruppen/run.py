@@ -6,6 +6,7 @@ import json
 from difflib import get_close_matches
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -28,6 +29,7 @@ from ultralytics import YOLO
 
 # --- Embedding retrieval (ResNet18 ImageNet, no fine-tuning) ---
 RESNET18_LOCAL_WEIGHTS = "resnet18-f37072fd.pth"
+PRODUCT_EMBEDDINGS_JSON = "product_embeddings.json"
 SIM_THRESHOLD = 0.3
 REF_IMAGE_PRIORITY = ("main.jpg", "front.jpg", "back.jpg", "left.jpg", "right.jpg", "top.jpg", "bottom.jpg")
 MAX_REF_IMAGES_PER_PRODUCT = 3
@@ -168,6 +170,36 @@ def _build_reference_index(
     return emb, labels
 
 
+def _load_precomputed_embeddings(
+    model_dir: Path, code_to_cat: dict[str, int]
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Load {product_code: 512-d vector} from product_embeddings.json (no pickle — sandbox-safe)."""
+    path = model_dir / PRODUCT_EMBEDDINGS_JSON
+    if not path.is_file():
+        return None
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        return None
+    data = {str(k): v for k, v in raw.items()}
+    rows: list[torch.Tensor] = []
+    cats: list[int] = []
+    for code, cid in sorted(code_to_cat.items()):
+        if code not in data:
+            continue
+        arr = np.asarray(data[code], dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            continue
+        arr = arr / (float(np.linalg.norm(arr)) + 1e-8)
+        rows.append(torch.from_numpy(arr))
+        cats.append(cid)
+    if not rows:
+        return None
+    emb = torch.stack(rows, dim=0)
+    labels = torch.tensor(cats, dtype=torch.long)
+    return emb, labels
+
+
 @torch.no_grad()
 def _nearest_category(
     query: torch.Tensor,
@@ -215,24 +247,45 @@ def main():
     # --- Optional: reference embedding library ---
     ref_root = model_dir / "NM_NGD_product_images"
     meta_path = ref_root / "metadata.json"
+    if not meta_path.is_file():
+        _meta_fallback = model_dir / "metadata.json"
+        if _meta_fallback.is_file():
+            meta_path = _meta_fallback
     ann_path = _find_annotations_path(model_dir)
     ref_emb_cpu: torch.Tensor | None = None
     ref_labels_cpu: torch.Tensor | None = None
     embedder: nn.Module | None = None
     tfm: transforms.Compose | None = None
 
-    if ann_path and meta_path.is_file() and ref_root.is_dir():
+    if ann_path and meta_path.is_file():
         try:
             code_to_cat = _build_product_code_to_category(ann_path, meta_path)
             print(f"Product code → category map: {len(code_to_cat)} entries (from metadata + COCO names)")
-            embedder, tfm = _make_resnet18_embedder(device, model_dir)
-            built = _build_reference_index(ref_root, code_to_cat, embedder, tfm, device)
-            if built is not None:
-                ref_emb_cpu, ref_labels_cpu = built[0].cpu(), built[1].cpu()
-                print(f"Reference embeddings: {ref_emb_cpu.shape[0]} vectors, dim={ref_emb_cpu.shape[1]}")
+
+            precomputed = _load_precomputed_embeddings(model_dir, code_to_cat)
+            if precomputed is not None:
+                ref_emb_cpu, ref_labels_cpu = precomputed[0].cpu(), precomputed[1].cpu()
+                print(
+                    f"Loaded {ref_emb_cpu.shape[0]} pre-computed embeddings from {PRODUCT_EMBEDDINGS_JSON}"
+                )
+                embedder, tfm = _make_resnet18_embedder(device, model_dir)
+            elif ref_root.is_dir():
+                print("Building embeddings from images")
+                embedder, tfm = _make_resnet18_embedder(device, model_dir)
+                built = _build_reference_index(ref_root, code_to_cat, embedder, tfm, device)
+                if built is not None:
+                    ref_emb_cpu, ref_labels_cpu = built[0].cpu(), built[1].cpu()
+                    print(
+                        f"Reference embeddings: {ref_emb_cpu.shape[0]} vectors, dim={ref_emb_cpu.shape[1]}"
+                    )
+                else:
+                    print("No reference images loaded — classification from embeddings disabled")
+                    embedder, tfm = None, None
             else:
-                print("No reference images loaded — classification from embeddings disabled")
-                embedder, tfm = None, None
+                print(
+                    "No product_embeddings.json and no NM_NGD_product_images/ — "
+                    "classification from embeddings disabled (YOLO only)"
+                )
         except Exception as e:
             print(f"Embedding library setup failed ({e}) — using YOLO class ids only")
             embedder, tfm = None, None
@@ -240,7 +293,7 @@ def main():
     else:
         print(
             "Skipping embedding library (need train/annotations.json or annotations.json, "
-            "NM_NGD_product_images/metadata.json, and image folders)"
+            "and metadata.json under NM_NGD_product_images/ or next to run.py)"
         )
 
     image_files = sorted(

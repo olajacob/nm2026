@@ -7,8 +7,13 @@ Strategy:
   2. Build static prior tensor (ocean/mountain = 100% confident, no queries needed)
   3. Use queries ONLY on dynamic zones around initial settlements
   4. Deep-sample seed_index 0 (30 queries) for stochastic distribution
-  5. Spot-check seeds 1–4 (5 queries each), blend with learned priors
-  6. Submit per seed via POST /submit
+  5. Spot-check seeds 1–4 (5 queries each) with rotated viewports so seeds do not
+     all hit the same windows — broader spatial coverage per ensemble
+  6. Respect server remaining query budget (not only a hardcoded cap)
+  7. Submit per seed via POST /submit
+
+Note: "Astar Island" is a simulation + prediction track; this file is not graph A*.
+Pathfinding heuristics (Manhattan, JPS) do not apply — scoring is KL on class probs.
 """
 
 from __future__ import annotations
@@ -292,12 +297,40 @@ def get_dynamic_viewports(initial_grid: np.ndarray,
     return chosen
 
 
+def viewports_for_seed(
+    dynamic_vp: list[tuple[int, int, int, int]],
+    seed_index: int,
+    n_seeds: int,
+    max_q: int,
+    *,
+    deep_repeat: bool,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Build viewport list for one seed.
+
+    seed 0: repeat ranked viewports (deep_repeat) to stack stochastic samples.
+    seeds 1+: rotate into the ranked list so each seed spends its small budget on
+    different map regions (same priorities, shifted window — avoids five identical
+    simulate calls for every non-zero seed when budget is tight).
+    """
+    if max_q <= 0 or not dynamic_vp:
+        return []
+    if deep_repeat:
+        return (dynamic_vp * 6)[:max_q]
+    n_vp = len(dynamic_vp)
+    stride = max(1, n_vp // max(2, n_seeds))
+    start = (seed_index * stride) % n_vp
+    rotated = dynamic_vp[start:] + dynamic_vp[:start]
+    return rotated[:max_q]
+
+
 # ── Observation & Tensor Update ───────────────────────────────────────────────
 
 def run_observations(round_id: str, seed_index: int,
                      viewports: list[tuple[int,int,int,int]],
                      max_queries: int, query_log: list,
-                     settlement_stats: dict) -> tuple[np.ndarray, np.ndarray]:
+                     settlement_stats: dict,
+                     budget_cap: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Execute queries and accumulate class counts per cell.
     Also collects settlement stats (population, food, etc.) for richer priors.
@@ -308,7 +341,7 @@ def run_observations(round_id: str, seed_index: int,
     this_seed_q  = 0
 
     for vx, vy, vw, vh in viewports:
-        if len(query_log) >= QUERY_BUDGET or this_seed_q >= max_queries:
+        if len(query_log) >= budget_cap or this_seed_q >= max_queries:
             break
 
         try:
@@ -345,7 +378,7 @@ def run_observations(round_id: str, seed_index: int,
                 "food":       s.get("food", 0),
             })
 
-        remaining = QUERY_BUDGET - len(query_log)
+        remaining = budget_cap - len(query_log)
         print(f"   [{this_seed_q}/{max_queries}] vp=({vx},{vy},{vw}×{vh}) "
               f"| budget left: {remaining}")
 
@@ -446,6 +479,9 @@ def run_round(round_id: str | None = None):
         seed_0_queries = 0
     print(f"   Allocation: seed_0={seed_0_queries}, other_seeds={other_seed_queries} each")
 
+    # Hard cap for this run = server remaining (same as allocation math above).
+    budget_cap = max(0, remaining)
+
     query_log = []
 
     for seed_index in range(n_seeds):
@@ -461,20 +497,23 @@ def run_round(round_id: str | None = None):
         # Identify dynamic viewports
         dynamic_vp = get_dynamic_viewports(initial_grid, initial_state)
 
-        # Allocate queries
+        # Allocate queries + viewports (seed 0 deep-repeat; others rotated)
         if seed_index == 0:
             max_q = seed_0_queries
-            # Repeat top viewports to get stochastic distribution per cell
-            viewports = (dynamic_vp * 6)[:max_q]
+            viewports = viewports_for_seed(
+                dynamic_vp, seed_index, n_seeds, max_q, deep_repeat=True
+            )
         else:
             max_q = other_seed_queries
-            viewports = dynamic_vp[:max_q]
+            viewports = viewports_for_seed(
+                dynamic_vp, seed_index, n_seeds, max_q, deep_repeat=False
+            )
 
         # Run observations
-        print(f"   🔍 Querying {max_q} viewports...")
+        print(f"   🔍 Querying {len(viewports)} viewports...")
         settlement_stats = {}
         counts, sample_count = run_observations(
-            round_id, seed_index, viewports, max_q, query_log, settlement_stats
+            round_id, seed_index, viewports, max_q, query_log, settlement_stats, budget_cap
         )
 
         # Merge with priors
@@ -511,7 +550,17 @@ def validate_tensor(tensor: np.ndarray, label: str = "") -> np.ndarray:
     return tensor  # Return the fixed tensor
 
 
+def _self_test_viewports_for_seed() -> None:
+    vp = [(i, 0, 10, 10) for i in range(0, 25, 5)]
+    deep = viewports_for_seed(vp, 0, 5, 4, deep_repeat=True)
+    assert deep == (vp * 6)[:4], deep
+    a = viewports_for_seed(vp, 1, 5, 2, deep_repeat=False)
+    b = viewports_for_seed(vp, 2, 5, 2, deep_repeat=False)
+    assert a[0] != b[0], (a, b)
+
+
 if __name__ == "__main__":
+    _self_test_viewports_for_seed()
     try:
         run_round()   # Auto-detects active round
     except requests.HTTPError as e:

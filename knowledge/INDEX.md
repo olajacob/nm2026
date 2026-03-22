@@ -15,7 +15,8 @@
 | NG track limits & scoring detail | [norgesgruppen.md](norgesgruppen.md) |
 | Deadlines, tracks, submission | [competition/rules.md](competition/rules.md) |
 | Leaderboard snapshot & gaps | [competition/leaderboard.md](competition/leaderboard.md) |
-| Astar Island | [astar.md](astar.md) |
+| Astar Island (overview) | [astar.md](astar.md) |
+| **Astar Island strategy** (budget, viewports, not graph A*) | [astar/strategy.md](astar/strategy.md) |
 | Repo layout, env | [repo.md](repo.md) |
 | Test-before-submit, `/nmai` workflow | [conventions/workflow.md](conventions/workflow.md) |
 | Recurring failures (append new) | [ERRORS.md](ERRORS.md) |

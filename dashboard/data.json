@@ -1,0 +1,37 @@
+{
+  "updated": "2026-03-22 (Astar viewport rotation + budget_cap; dashboard slice)",
+  "source_of_truth_tripletex": "nmai2026/tripletex/data.json",
+  "leaderboard": {
+    "team": "Kongsberg Development Agent",
+    "rank": 128,
+    "total_teams": 401,
+    "score_total": 58.75,
+    "tripletex": 20.3,
+    "norgesgruppen": 14.0,
+    "astar": 24.5,
+    "leader_astar_example": {
+      "team": "Ave Christus Rex",
+      "astar": 53.0,
+      "gap_points": 28.5
+    }
+  },
+  "astar": {
+    "client": "nmai2026/astar/astar_client.py",
+    "knowledge": "nmai2026/knowledge/astar/strategy.md",
+    "final_sprint_change": "Seeds 1+ use rotated viewport list (spatial diversity); query loop uses server remaining budget_cap.",
+    "note": "Astar Island is simulation+KL prediction, not graph A*. Next levers: priors, viewport scoring, entropy-focused sampling."
+  },
+  "backlog": [
+    {
+      "id": "astar-sprint-2026-03-22",
+      "status": "done",
+      "title": "Astar client: viewport rotation + budget_cap",
+      "detail": "viewports_for_seed(); run_observations(budget_cap); self-test; strategy.md + dashboard.",
+      "affects": ["astar"]
+    }
+  ],
+  "notes": [
+    "Tripletex task board remains in tripletex/data.json — this file is a cross-track dashboard slice.",
+    "Re-run astar_client.py with ASTAR_TOKEN after deploy; verify platform Astar score after next round."
+  ]
+}

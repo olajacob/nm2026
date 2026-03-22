@@ -55,6 +55,10 @@ from agent import (
     SolveRequest,
     TripletexAPI,
     TripletexCredentials,
+    build_dynamic_system_prompt,
+    extract_prompt_structured_hints,
+    infer_task_family,
+    _parse_tool_body_object,
     _apply_invoice_payment_paid_amount_guard,
     _apply_tripletex_get_sanitizers,
     _employment_division_put_rejected,
@@ -135,6 +139,66 @@ def run_agent_unit_tests() -> int:
         err += 1
     else:
         _ok("_nmiai_proxy_expired_token_detail (local)")
+
+    if infer_task_family("=== File: bank.csv ===\nAmount;Ref") != "bank_csv":
+        _fail("infer_task_family: expected bank_csv for === File: CSV block")
+        err += 1
+    else:
+        _ok("infer_task_family bank_csv (local)")
+
+    if infer_task_family("Korriger feil i bilagene i januar") != "ledger_audit":
+        _fail("infer_task_family: expected ledger_audit for feil i bilag")
+        err += 1
+    else:
+        _ok("infer_task_family ledger_audit (local)")
+
+    if infer_task_family('Opprett produktet "X" med pris 100 kr') != "default":
+        _fail("infer_task_family: product create should stay default family")
+        err += 1
+    else:
+        _ok("infer_task_family default for product-style prompt (local)")
+
+    if infer_task_family("Gjennomfør heile prosjektsyklusen for Dataplattform Skogheim") != "project_cycle":
+        _fail("infer_task_family: Nynorsk prosjektsyklus should be project_cycle (not supplier_inv)")
+        err += 1
+    else:
+        _ok("infer_task_family project_cycle — prosjektsyklus (local)")
+
+    if infer_task_family("Registrer timar på prosjekt og send faktura til kunde") != "project_cycle":
+        _fail("infer_task_family: timar + prosjekt/faktura → project_cycle")
+        err += 1
+    else:
+        _ok("infer_task_family project_cycle — timar + faktura (local)")
+
+    _dyn = build_dynamic_system_prompt("test")
+    if "PRIORITIZED MODE FOR THIS REQUEST" not in _dyn or "(family:" not in _dyn:
+        _fail("build_dynamic_system_prompt: expected router section appended")
+        err += 1
+    else:
+        _ok("build_dynamic_system_prompt includes PRIORITIZED MODE (local)")
+
+    _hints = extract_prompt_structured_hints("Fra 2026-03-15 betal faktura — 12 500,50 kr og konto 1920")
+    if "2026-03-15" not in _hints or "12 500,50 kr" not in _hints.lower():
+        _fail(f"extract_prompt_structured_hints: expected date + amount, got {_hints[:200]!r}")
+        err += 1
+    else:
+        _ok("extract_prompt_structured_hints date + NOK amount (local)")
+
+    _pb, _pe = _parse_tool_body_object(
+        '{"travelExpense": {"id": 111}, "amountCurrencyIncVat": 4100, "paymentType": {"id": 41}}'
+    )
+    if _pe or _pb.get("amountCurrencyIncVat") != 4100:
+        _fail(f"_parse_tool_body_object JSON string: err={_pe!r} d={_pb!r}")
+        err += 1
+    else:
+        _ok("_parse_tool_body_object parses JSON string to dict (local)")
+
+    _pb2, _pe2 = _parse_tool_body_object("[1,2]")
+    if _pe2 is None or "object" not in _pe2.lower():
+        _fail(f"_parse_tool_body_object array should error, got {_pe2!r}")
+        err += 1
+    else:
+        _ok("_parse_tool_body_object rejects JSON array (local)")
 
     try:
         _b_te = _enrich_travel_expense_post_body(

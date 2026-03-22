@@ -1547,6 +1547,7 @@ TOOLS = [
             "**D)** Last resort: **POST** shell **`postings: []`** + **`sendToLedger=false`**, then **POST /ledger/voucher/{id}/postings** per line.\n"
             "**Bank accounts:** **`execute_tool`** blocks postings to **`isBankAccount`** GL (**1920**, …) — Tripletex rejects them on manual vouchers; use **8060/8160** + **1500/2900** for valutaeffekter. Env **`TRIPLETEX_VOUCHER_ALLOW_BANK_LINES=1`** skips the check (sandbox only).\n"
             "**Dimensions:** use **`freeAccountingDimension1: {id: VALUE_ID}`** on the **debit** line (or **`accountingDimensionValues`** — runtime maps to **`freeAccountingDimension1`**). **Never** same **`account.id`** on both sides (see SYSTEM_PROMPT **CRITICAL — custom dimension**).\n"
+            "**Year-end depreciation (Jahresabschluss / avskrivning):** **never** reuse one **`account.id`** for **every** depreciation voucher when assets differ. If **`GET /ledger/account?number=6010`** shows **`name`** with **transport** / **kjøretøy** / **transportmidler**, **do not** debit that **`id`** for **Programvare** / **software** — **`GET` 6020** instead; **Kontormaskiner** / **IT** on **12xx** → **6000** / **6020** / task-named **6xxx**, not transport **6010**, unless the task explicitly maps them to **6010** (SYSTEM_PROMPT **Month-end / accruals**).\n"
             "On **422** for a sub-resource line, **retries once** with **negated** **`amountGross`**.\n"
             "**`send_to_ledger`: true** → after a successful create, **`PUT /ledger/voucher/{id}/:sendToLedger`** — **never** **`?sendToLedger=true`** on an **empty** shell.\n"
             "Optional **`shell_extras`**: extra **Voucher** fields (not **postings**). Use **`shell_extras.customer`** or top-level **`customer`** so **debit** lines get **`customer: {id}`** when the tenant requires it (e.g. **1500** reminder fees). "
@@ -1690,8 +1691,10 @@ If **PUT /ledger/account/{id}** returns **422** (e.g. **`version`** required), *
 If you are **not** about to **`:invoice`**, **skip** this entire 1920 block (see **WHEN TO SKIP** above).
 
 LANGUAGES: Tasks arrive in Norwegian, Nynorsk, English, German, French, Spanish, or Portuguese. Understand fully before acting. **Invoice «send» cues:** e.g. **send** / **e-post** / **email** (EN/NO), **enviar** / **envie** / **mandar** (PT/ES), **envoyer** (FR), **senden** / **versenden** (DE) — if present, you must **`PUT /invoice/{id}/:send`** after **`:invoice`** (see **Create invoice**).
-**German (DE) — ledger / cost analysis:** **Hauptbuch**, **Aufwandskonten**, **Kosten**, **Januar**/**Februar** comparisons → **`GET /ledger/voucher`** + voucher **postings**; sum **debit** on expense accounts (classes **5–8**). **Do not** **`POST /project`** / **`POST /customer`** when the task is **only** analysis or ranking accounts — create entities **only** if wording **explicitly** requires **Projekt**/**Kunde**/registration.
-**French (FR) / EN — coûts, grand livre, Jan–Feb spike + internal project:** **coûts totaux**, **grand livre**, **comptes de charges**, **augmentation**, **janvier**/**février** (or EN **January**/**February** / **general ledger** / **expense accounts** / **internal project**) → same **`GET /ledger/voucher`** + **`GET /ledger/voucher/{id}`** postings; per month sum **`amount`** on **expense** lines (**`account.number`** typically **5xxx–8xxx**, **`amount` > 0**); rank accounts by **(later month total − earlier month total)**. If the task asks for **one** internal / analysis project (**un projet interne**, **singular**), **`POST /project` once** with a **project name** that reflects the **analysis** (not **three** projects named after each **GL account description**) **unless** the prompt explicitly requires **separate** projects per account. **`projectManager: {id}`** is **mandatory** — **`GET /employee`** first. **Do not** **`POST /activity`** without **`activityType`** — use **`{id: N}`** **or** the **string enum** on **`GET /activity`** (**GENERAL_ACTIVITY**, **PROJECT_GENERAL_ACTIVITY**, …). **`GET /activityType`** often **404** — do **not** loop on it; copy **`activityType`** from **`GET /activity`** instead.
+**Portuguese / Spanish — ledger errors (correction, not analysis):** **erros no livro razão**, **encontrar os erros**, **conta errada**, **corrigir**, **lançamento** / ES **errores**, **mayor**, **corregir** → you **must** **`tripletex_post_voucher`** (or other write) after **`GET /ledger/voucher` + `GET /ledger/voucher/{id}`** — **same** as **Ledger audit / error correction**. **Do not** treat this like **ranking**/**analysis** only.
+**English (EN) — ledger errors:** **errors in the general ledger**, **discovered errors**, **wrong account**, **find the … errors**, **review … vouchers** (and **fix**/**correct**) → **`tripletex_post_voucher`** (**Ledger audit / error correction**) — **not** the **Jan–Feb cost spike** paragraph below.
+**German (DE) — ledger / cost analysis:** **Hauptbuch**, **Aufwandskonten**, **Kosten**, **Januar**/**Februar** comparisons **without** words like **Fehler korrigieren** / **buchhalterische Korrektur** → **`GET /ledger/voucher`** + voucher **postings**; sum **debit** on expense accounts (classes **5–8**). **Do not** **`POST /project`** / **`POST /customer`** when the task is **only** analysis or ranking accounts — create entities **only** if wording **explicitly** requires **Projekt**/**Kunde**/registration. If the task asks to **fix** ledger **Fehler**, follow **Ledger audit / error correction** (**`tripletex_post_voucher`**).
+**French (FR) / EN — Jan–Feb cost spike + internal project (analysis only — not voucher error fixes):** **coûts totaux**, **grand livre**, **comptes de charges**, **augmentation**, **janvier**/**février** (or EN **January**/**February** / **expense accounts** / **internal project** / **which account** **increased**) when the task is **only** comparing **totals** or **trends** — same **`GET /ledger/voucher`** + **`GET /ledger/voucher/{id}`** postings; per month sum **`amount`** on **expense** lines (**`account.number`** typically **5xxx–8xxx**, **`amount` > 0**); rank accounts by **(later month total − earlier month total)**. **If** the prompt asks to **find**/**fix**/**correct** **errors**, **wrong postings**, or **wrong account** (even if it says **general ledger**), **skip** this paragraph — use **Ledger audit / error correction** (**`tripletex_post_voucher`**). If the task asks for **one** internal / analysis project (**un projet interne**, **singular**), **`POST /project` once** with a **project name** that reflects the **analysis** (not **three** projects named after each **GL account description**) **unless** the prompt explicitly requires **separate** projects per account. **`projectManager: {id}`** is **mandatory** — **`GET /employee`** first. **Do not** **`POST /activity`** without **`activityType`** — use **`{id: N}`** **or** the **string enum** on **`GET /activity`** (**GENERAL_ACTIVITY**, **PROJECT_GENERAL_ACTIVITY**, …). **`GET /activityType`** often **404** — do **not** loop on it; copy **`activityType`** from **`GET /activity`** instead.
 
 SCORING — THIS MATTERS:
 - You are scored on CORRECTNESS (field-by-field checks) and EFFICIENCY (API call count + zero 4xx errors)
@@ -1701,6 +1704,7 @@ SCORING — THIS MATTERS:
 - **Bank CSV / attached text files:** the **full file text** is included in your user message (lines starting with **`=== File:`** …). **You must** parse it and **call tools** — **never** `end_turn` with zero tool uses when the task is reconciliation / registration from that file
 - **Full project lifecycle / hours:** if the prompt mentions **hours**, **timer**, or a **complete** project flow, **finish** project + fixed price (if budget) + **every** **timesheet** line + invoice chain if asked — see **Full project lifecycle** — **never** `end_turn` halfway
 - **Ledger audit / corrections:** if the prompt asks to **fix** / **correct** voucher or posting **errors**, **finish** with **`tripletex_post_voucher`** (and pagination on **`GET /ledger/voucher`** as needed) — **never** `end_turn` after only **GET**s — see **Ledger audit / error correction**
+- **Year-end depreciation / tax accrual:** **`tripletex_post_voucher`** — **separate** expense **`account.id`** per asset; if **6010** = **transport**-only, **not** for **software** (**6020**) or **office machines** unless the task says so — see **Month-end / accruals** and **`tripletex_post_voucher`** tool note
 - **Supplier invoice (leverandørfaktura):** if the task is to **register** a **received** supplier invoice, **finish** with **`POST /supplierInvoice`** (and **`PUT …/:approve`** if asked) — **never** `end_turn` after only **`POST /customer`** / ledger **GET**s — see **Register supplier invoice**
 - Plan your full call sequence before making the first request
 
@@ -1987,7 +1991,7 @@ Other lookups ( explore Swagger + **GET** **`fields`** before **POST** ):
 - **GET** `/ledger/account`, **GET** `/department` — accounts and departments for postings
 - **GET** `/project/orderline` [BETA] — if the task ties amounts to project lines
 
-**Month-end / accruals (*periodisering*, *avskrivning*, *clôture*, *depreciação*, year-end tax):** **Prepaid / forskudd / leie** → **Dr** **6300** (*Leie lokale*) or another **6xxx** *leie/lokale* **`GET` by number** — **not** **6000** (*avskrivning på bygninger*) for ordinary **lease** reversal unless the task names **6000**; **not** **7140**/travel or **5000**/lønn unless the task says so. **Cr** the prepayment account named (**1700**, …). **Depreciation:** for **each** asset, **`GET /ledger/account?number=<exact task GL>&fields=id,number,name`** and use that **`id`** on the **credit** (−**amountGross**) line — returned **`number`** must match (**1250** vs **1240** *traktor*); **do not** swap asset accounts. **Dr** expense per type — **`GET` 6010/6020/6540**: if **6010**’s **`name`** is **only** *transport* / *kjøretøy*, **do not** use it for **programvare** / **IT** — use **6020**/**6540**. **Tax accrual (22% etc.):** **Dr** **8300**, **Cr** **2500** (*betalbar skatt*) — **`GET` those numbers** — **never** **2920** (*gjeld … samme konsern*) for corporate tax provision; **never** post **all-zero** lines — compute NOK from the **profit/base the task states**; **`send_to_ledger: true`** when booking.
+**Month-end / accruals (*periodisering*, *avskrivning*, *clôture*, *depreciação*, year-end tax):** **DE** **Jahresabschluss**, **Abschreibung**, **vereinfacht** → same rules. **Prepaid / forskudd / leie** → **Dr** **6300** (*Leie lokale*) or another **6xxx** *leie/lokale* **`GET` by number** — **not** **6000** (*avskrivning på bygninger*) for ordinary **lease** reversal unless the task names **6000**; **not** **7140**/travel or **5000**/lønn unless the task says so. **Cr** the prepayment account named (**1700**, …). **Depreciation:** for **each** asset, **`GET /ledger/account?number=<exact task GL>&fields=id,number,name`** and use that **`id`** on the **credit** (−**amountGross**) line — returned **`number`** must match (**1250** vs **1240** *traktor*); **do not** swap asset accounts. **Dr** expense **per asset line in the prompt** — **never** one single **`account.id`** for every voucher when assets differ. **`GET /ledger/account?number=6010&fields=id,number,name`** first: if **`name`** mentions **transport** / **transportmidler** / **kjøretøy** / **Fahrzeug**, that **`id`** is **only** for **vehicle/fleet**-type assets the task names as such — **not** for **Programvare** / **Programmsoftware** / **software** (**`GET` 6020** for debit) and **not** for **Kontormaskiner** / generic **IT-utstyr** / **machines** on **12xx** unless the task explicitly says **6010** (use **`GET` 6020**, **6000**, or **6540** / task-**named 6xxx** by **name** match). **Tax accrual (22% etc.):** **Dr** **8300**, **Cr** **2500** (*betalbar skatt*) — **`GET` those numbers** — **never** **2920** (*gjeld … samme konsern*) for corporate tax provision; **never** post **all-zero** lines — compute NOK from the **profit/base the task states**; **`send_to_ledger: true`** when booking.
 
 Book expense from receipt (kvittering / **bilag fra PDF**) — **Task 22 pattern** (**togbillett**, **train ticket**, **receipt PDF**, **bokfør utgift**, **kvittering**, **department** + **MVA**):
 When the task is to **book** a **purchase** from an **attached PDF receipt** on the **general ledger** (manual journal — **not** the full **POST /travelExpense** + **POST /travelExpense/cost** flow unless the prompt explicitly asks for a **travel report**), follow this path:
@@ -2031,7 +2035,10 @@ Search vouchers:
 GET /ledger/voucher?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD&fields=id,date,description,number
 CRITICAL: **dateFrom** and **dateTo** are required. **dateTo** must be **strictly after** **dateFrom**. **Voucher** list **`fields`**: **`number`** = bilagsnummer — **illegal**: **`voucherNumber`**, **`amount`** on **`VoucherDTO`** (**400**). Line amounts → **`postings`** on **`GET /ledger/voucher/{id}`** only.
 
-Ledger audit / error correction: When the task asks to **fix** voucher/ledger errors, **finish** with **`tripletex_post_voucher`** — **never** only **`tripletex_get`**. **List** **`GET /ledger/voucher`** with **`dateFrom`/`dateTo`**, **`fields=id,date,description,number`** (no heavy **`postings`** on list — paginate). **Detail** **`GET /ledger/voucher/{id}`** for suspects (tool expands **`postings(...)`**). Map task hints to **`voucher.id`** + lines; **correct** via **mirror-reverse** wrong lines + repost right **`account.id`**; **balance** sum **`amountGross`=0**; **`send_to_ledger: true`** when expected. **Reversing** a line that hit **1920** on the original: **do not** put **1920** on the **correction** voucher — **`tripletex_post_voucher`** **blocks** bank lines; use **2900** (*Forskudd fra kunder*) or another **non-bank** clearing (**`GET /ledger/account?number=2900`**) as the offset for **duplicate** / **mirror-reverse** corrections.
+Ledger audit / error correction: When the task asks to **fix** voucher/ledger errors, **finish** with **`tripletex_post_voucher`** — **never** only **`tripletex_get`**. **List** **`GET /ledger/voucher`** with **`dateFrom`/`dateTo`**, **`fields=id,date,description,number`** (no heavy **`postings`** on list — paginate). **Efficiency:** If the prompt names **N** concrete mistakes (e.g. wrong **GL** + **amount**), **open detail only for vouchers likely to match** (description keywords, date range, duplicate numbers) — **post the first correction voucher before** you have opened **every** voucher in the period. **If** **N > 1**, **batch** several **`tripletex_post_voucher`** calls in **one** assistant turn when possible so you **finish all N fixes** before **max iterations**. **Detail** **`GET /ledger/voucher/{id}`** for suspects (tool expands **`postings(...)`**). Map task hints to **`voucher.id`** + lines; **correct** via **mirror-reverse** wrong lines + repost right **`account.id`**; **balance** sum **`amountGross`=0**; **`send_to_ledger: true`** when expected.
+**Wrong expense account (reclass) — use net `amount` when **2710** is on the same voucher:** On **`GET /ledger/voucher/{id}`**, the expense line has **`amount`** (net) and **`amountGross`** (gross). If a **separate** **2710** line already books **inngående MVA** on that voucher, the **two-line reclass** between wrong and right **expense** GL (**6540**→**6860**, **6340**→**6390**, …) must use **±`amount`** (net) on those lines — **not** **`amountGross`**, or you **double-count** VAT vs **2710**. The task’s “**NOK**” figure often matches **`amountGross`** on the wrong line — **still** swap using **`amount`** for the expense pair unless the brief says **VAT** on that voucher is wrong too.
+**Example — wrong expense GL:** Task: **6340**→**6390**, **4200** stated → locate line **6340** with **`amountGross` 4200**, **`amount` 3360** → **`tripletex_post_voucher`**: **debit** **6390** **`amountGross` +3360**, **credit** **6340** **−3360** (same pattern for **6540**→**6860** with **`amount` 3840** when **`amountGross` 4800** and **2710** present). **Do not** duplicate **2710**/**1920** unless the error text says VAT or bank is wrong.
+**Reversing** a line that hit **1920** on the original: **do not** put **1920** on the **correction** voucher — **`tripletex_post_voucher`** **blocks** bank lines; use **2900** (*Forskudd fra kunder*) or another **non-bank** clearing (**`GET /ledger/account?number=2900`**) as the offset for **duplicate** / **mirror-reverse** corrections.
 
 If **403** **`details`** include **nmiai-proxy** + **Invalid or expired proxy token**: **stop** assuming the run can succeed — **do not** use placeholder **`account:{id}`** values; **do not** claim completion. **Otherwise**, **403** may be transient — **continue** with remaining planned calls. **Fresh** `session_token` per **new** submission; frequent proxy failures → **organisers**.
 
@@ -2066,6 +2073,245 @@ GET tips:
 ZERO 4xx POLICY: If you are unsure about a field name or required field, use GET first to inspect the data model on one call — then POST correctly. One exploratory GET is better than a failed POST."""
 
 SYSTEM_PROMPT = SYSTEM_PROMPT.replace("86011117947", COMPETITION_BANK_ACCOUNT)
+
+# ── Task-family router + structured prompt hints (per-request) ───────────────
+
+TASK_FAMILY_DEFAULT = "default"
+
+TASK_FAMILY_ADDENDA: dict[str, str] = {
+    TASK_FAMILY_DEFAULT: (
+        "No narrow **task family** matched the user text — follow the **full** instructions above. "
+        "Still: batch independent **GET**s when possible; finish with the **POST**/**PUT** the task requires."
+    ),
+    "bank_csv": (
+        "**Bank reconciliation / CSV:** Parse **`=== File:`** blocks — every matched payment needs a real **`PUT /invoice/.../:payment`** "
+        "or supplier **`:addPayment`**; **`paidAmount`** from **`GET /invoice/{id}`** open balance or the CSV line; do not `end_turn` with only GETs."
+    ),
+    "ledger_audit": (
+        "**Ledger error correction:** Finish with **`tripletex_post_voucher`** (or other required writes) — not GET-only. "
+        "Reclass expense GL using **`amount` (net)** when **2710** is on the same bilag; **batch** corrections in one turn when the task lists several fixes."
+    ),
+    "invoice_pay": (
+        "**Invoice payment / FCY:** **`:payment`** **`paidAmount`** = **`amountOutstanding`** / **`amountCurrencyOutstanding`** from **`GET /invoice/{id}`** — never FCY×rate in **`paidAmount`**; "
+        "FX bilag **8060/8160** + **1500/2900** only if asked — **not** **1920** in vouchers."
+    ),
+    "supplier_inv": (
+        "**Supplier invoice:** Primary **`POST /supplierInvoice`**; on **HTTP 500 code 1000** use **`tripletex_post_voucher`** once (no duplicate same invoice+supplier). **`:approve`** if the task says attest/godkjenn."
+    ),
+    "travel": (
+        "**Travel:** **`POST /travelExpense`** shell without **`paymentType`**; costs on **`POST /travelExpense/cost`** with **`paymentType`**, **`costCategory`**, **`vatType`** per line."
+    ),
+    "payroll_hr": (
+        "**Payroll / HR:** **`GET /employee?email=`** before **POST /employee**; **employment** + **`division`** / **`POST /employee/employment/details`** before **POST /salary/transaction**; valid **year/month** vs **startDate**."
+    ),
+    "project_cycle": (
+        "**Project + invoice + send:** **`projectManager`**, **timesheet** lines, **`PUT /order/.../:invoice`**, then **`PUT /invoice/.../:send`** if e-post/send wording; **1920** only when **`:invoice`** path needs it."
+    ),
+    "month_close": (
+        "**Month-end / accrual / depreciation:** **Dr** cost **6300**/task GL, **Cr** **1700** prepaid as stated; **depreciation** — separate expense **account.id** per asset type; "
+        "if **6010** **`name`** = transport only, **not** for software — **`GET` 6020**; **tax** **8300**/**2500** per brief. **`send_to_ledger: true`**."
+    ),
+    "voucher_general": (
+        "**Manual bilag:** **`tripletex_post_voucher`** only; **Σ amountGross=0**; **no** **1920**; dimensions → **`freeAccountingDimension*`**; supplier on **2400** credit line."
+    ),
+}
+
+
+def infer_task_family(user_prompt: str) -> str:
+    """
+    Lightweight keyword router — ordered rules; first match wins.
+    Keys align with **TASK_FAMILY_ADDENDA** (except unknown → **TASK_FAMILY_DEFAULT**).
+    """
+    t = (user_prompt or "").lower()
+    if "=== file:" in t or (
+        "csv" in t
+        and any(k in t for k in ("bank", "kontoutskrift", "betaling", "payment", "utbetaling", "innbetaling"))
+    ):
+        return "bank_csv"
+    ledger_markers = (
+        "feil i bilag",
+        "feil i regnskap",
+        "korriger feil",
+        "korrigér feil",
+        "wrong account",
+        "find the errors",
+        "find the error",
+        "ledger error",
+        "general ledger",
+        "livro razão",
+        "grand livre",
+        "corrigir os erros",
+        "buchhalterische korrektur",
+        "fehler im hauptbuch",
+        "review all vouchers",
+        "discovered errors",
+    )
+    if any(m in t for m in ledger_markers):
+        return "ledger_audit"
+    # Project + timesheet + invoice cycle — **before** supplier_inv so «leverandør»+«faktura» in a long brief
+    # does not beat Nynorsk **timar** / **prosjektsyklus** (no English "timesheet" / \btimer\b match).
+    _pc_time = (
+        "timesheet" in t
+        or "timetype" in t
+        or re.search(r"\btimer\b", t) is not None
+        or "timar" in t
+        or "timeføring" in t
+        or "timeforing" in t
+    )
+    _pc_scope = any(
+        x in t for x in ("project", "prosjekt", "/order", " ordre", "faktura", "invoice")
+    )
+    if (
+        any(
+            m in t
+            for m in (
+                "prosjektsyklus",
+                "prosjektssyklus",
+                "project cycle",
+                "helhetlig prosjekt",
+            )
+        )
+        or (_pc_time and _pc_scope)
+    ):
+        return "project_cycle"
+    if any(
+        m in t
+        for m in (
+            "leverandørfaktura",
+            "leverandorfaktura",
+            "supplier invoice",
+            "/supplierinvoice",
+            "supplierinvoice",
+        )
+    ) or ("leverandør" in t and "faktura" in t) or ("fornecedor" in t and "fatura" in t):
+        return "supplier_inv"
+    if any(
+        m in t
+        for m in (
+            "/travelexpense",
+            "travel expense",
+            "reiseutgift",
+            "reisekost",
+            "diett",
+            "per diem",
+            "hotell",
+            "flybillett",
+            "taxi",
+        )
+    ) or (" fly " in f" {t} "):
+        return "travel"
+    if any(
+        m in t
+        for m in (
+            "lønn",
+            "fastlønn",
+            "timelønn",
+            "payroll",
+            "payslip",
+            "feriepenger",
+            "/salary/transaction",
+            "salary transaction",
+            "arbeidsforhold",
+            "nyansatt",
+        )
+    ):
+        return "payroll_hr"
+    if any(
+        m in t
+        for m in (
+            "månedsavslutning",
+            "månedlig avskrivning",
+            "periodisering",
+            "forskuddsbetalt",
+            "prepaid",
+            "jahresabschluss",
+            "vereinfachten jahresabschluss",
+            "avskrivning",
+            " depreciation",
+            "accrual",
+        )
+    ):
+        return "month_close"
+    if any(m in t for m in ("valutadifferanse", "currency difference", "amountoutstanding", ":payment")) or (
+        any(m in t for m in ("betal", "betaling", "betale", "oppgjør", "oppgjor", "payment"))
+        and any(m in t for m in ("faktura", "invoice", "kundefaktura"))
+    ):
+        return "invoice_pay"
+    if any(
+        m in t
+        for m in (
+            "tripletex_post_voucher",
+            "manuelt bilag",
+            "bokfør",
+            "bokfor",
+            "journalbilag",
+            "kontering",
+            "kostsenter",
+            "regnskapsdimensjon",
+        )
+    ):
+        return "voucher_general"
+    return TASK_FAMILY_DEFAULT
+
+
+def build_dynamic_system_prompt(user_prompt: str) -> str:
+    fam = infer_task_family(user_prompt)
+    addendum = TASK_FAMILY_ADDENDA.get(fam) or TASK_FAMILY_ADDENDA[TASK_FAMILY_DEFAULT]
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"## PRIORITIZED MODE FOR THIS REQUEST (family: **{fam}**)\n"
+        f"{addendum}\n"
+    )
+
+
+def extract_prompt_structured_hints(user_prompt: str) -> str:
+    """Regex/heuristic extraction — injected as a short user-side block (not a substitute for reading the task)."""
+    text = user_prompt or ""
+    if not text.strip():
+        return ""
+    parts: list[str] = [
+        "### STRUCTURED_HINTS (auto-extracted from the prompt — verify against task text)",
+        "",
+    ]
+    dates = sorted(set(re.findall(r"\b(20[0-3]\d-[01]\d-[0-3]\d)\b", text)))
+    if dates:
+        parts.append("- **Dates (ISO-like):** " + ", ".join(dates[:25]))
+    amt_patterns = re.findall(
+        r"\b\d{1,3}(?:[ \u00a0]\d{3})*(?:[.,]\d{2})?\s*(?:kr|nok)\b",
+        text,
+        flags=re.I,
+    )
+    if amt_patterns:
+        uniq_amt: list[str] = []
+        seen_a: set[str] = set()
+        for a in amt_patterns:
+            k = a.lower().replace("\u00a0", " ").strip()
+            if k not in seen_a:
+                seen_a.add(k)
+                uniq_amt.append(a.strip())
+        if uniq_amt:
+            parts.append("- **Currency amounts (verbatim):** " + ", ".join(uniq_amt[:15]))
+    gl_cands = re.findall(r"\b([1-9]\d{2,3})\b", text)
+    gl_out: list[str] = []
+    seen_g: set[str] = set()
+    for g in gl_cands:
+        if g in seen_g:
+            continue
+        if len(g) == 4 and g.startswith("20") and g.isdigit() and 2000 <= int(g) <= 2099:
+            continue
+        seen_g.add(g)
+        gl_out.append(g)
+        if len(gl_out) >= 20:
+            break
+    if gl_out:
+        parts.append(
+            "- **Numeric codes (possible GL — verify):** " + ", ".join(gl_out[:20])
+        )
+    if len(parts) <= 2:
+        return ""
+    parts.append("")
+    parts.append("_Machine-parsed; prefer explicit task wording when it conflicts._")
+    return "\n".join(parts)
 
 
 _VOUCHER_LIST_POSTINGS_NOTE = (
@@ -2401,6 +2647,67 @@ def _reject_manual_voucher_bank_lines(
     return None
 
 
+def _parse_tool_body_object(raw: Any) -> tuple[dict[str, Any], Optional[str]]:
+    """
+    Claude sometimes passes **tripletex_post**/**put** **body** as a JSON *string* instead of a nested object.
+    `requests` would then send an invalid payload → Tripletex 422 (*felt … Kan ikke være null*).
+    """
+    if raw is None:
+        return {}, None
+    if isinstance(raw, dict):
+        return dict(raw), None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return {}, None
+        try:
+            v = json.loads(s)
+        except json.JSONDecodeError as e:
+            return {}, f"Invalid JSON in body string: {e}"
+        if not isinstance(v, dict):
+            return (
+                {},
+                "Body JSON must be a single object {...}, not an array or primitive.",
+            )
+        return v, None
+    return {}, f"body must be object or JSON object string, not {type(raw).__name__}."
+
+
+def _warn_voucher_redundant_debit_accounts(postings_lines: list[Any]) -> None:
+    """
+    Soft signal when two **debit** lines (positive **amountGross**) reuse the same **account.id** —
+    common mistake for **depreciation** / split expenses that need distinct expense accounts.
+    """
+    norm, _ = _normalize_postings_lines(postings_lines)
+    debits_per_acc: dict[int, int] = {}
+    for li in norm:
+        acc = li.get("account")
+        if not isinstance(acc, dict):
+            continue
+        raw_id = acc.get("id")
+        aid: Optional[int] = None
+        if isinstance(raw_id, int):
+            aid = raw_id
+        elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+            aid = int(raw_id.strip())
+        if aid is None:
+            continue
+        ag = li.get("amountGross")
+        if ag is None:
+            ag = li.get("amount")
+        if not isinstance(ag, (int, float)):
+            continue
+        if float(ag) <= 0:
+            continue
+        debits_per_acc[aid] = debits_per_acc.get(aid, 0) + 1
+    dup = sorted(aid for aid, c in debits_per_acc.items() if c >= 2)
+    if dup:
+        _agent_print(
+            "  ⚠️  tripletex_post_voucher: multiple **debit** lines (positive **amountGross**) share the same **account.id** "
+            f"{dup} — often wrong for **depreciation** / split expenses; use **distinct** expense **account.id** per asset/type unless the task says otherwise."
+        )
+
+
 # ── Tool executor ─────────────────────────────────────────────────────────────
 
 def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
@@ -2512,9 +2819,18 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                     },
                     ensure_ascii=False,
                 )
-            body_out = inp["body"]
-            if not isinstance(body_out, dict):
-                body_out = {}
+            body_out, body_err = _parse_tool_body_object(inp.get("body"))
+            if body_err:
+                _agent_print(f"  ℹ️  tripletex_post: {body_err}")
+                return json.dumps(
+                    {
+                        "error": body_err,
+                        "_toolNote": (
+                            "Pass **body** as a nested JSON **object** in the tool call — not a string containing JSON."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             if _is_voucher_postings_subpath(path):
                 body_out = _normalize_voucher_posting_line(dict(body_out))
             path_only = urlparse(path).path.rstrip("/")
@@ -2735,6 +3051,7 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
             v_bank_err = _reject_manual_voucher_bank_lines(api, inp.get("postings") or [])
             if v_bank_err is not None:
                 return json.dumps(v_bank_err, ensure_ascii=False)
+            _warn_voucher_redundant_debit_accounts(inp.get("postings") or [])
             extras = inp.get("shell_extras")
             if extras is not None and not isinstance(extras, dict):
                 extras = None
@@ -2759,9 +3076,18 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
 
         elif name == "tripletex_put":
             path = inp["path"]
-            body = inp.get("body")
-            if not isinstance(body, dict):
-                body = {}
+            body, put_body_err = _parse_tool_body_object(inp.get("body"))
+            if put_body_err:
+                _agent_print(f"  ℹ️  tripletex_put: {put_body_err}")
+                return json.dumps(
+                    {
+                        "error": put_body_err,
+                        "_toolNote": (
+                            "Pass **body** as a nested JSON **object** — not a stringified JSON string."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             eid = _employment_id_from_path(path)
             div_put = _division_id_from_employment_put_body(body)
             _div_rej = _employment_division_put_rejected.get(eid, set()) if eid is not None else set()
@@ -2848,10 +3174,26 @@ def execute_tool(name: str, inp: dict, api: TripletexAPI) -> str:
                 pay_block = _apply_invoice_payment_paid_amount_guard(api, p_action, prms)
                 if pay_block is not None:
                     return json.dumps(pay_block, ensure_ascii=False)
+            raw_act_body = inp.get("body")
+            if raw_act_body is None:
+                action_body: Optional[dict[str, Any]] = None
+            else:
+                action_body, act_err = _parse_tool_body_object(raw_act_body)
+                if act_err:
+                    _agent_print(f"  ℹ️  tripletex_put_action: {act_err}")
+                    return json.dumps(
+                        {
+                            "error": act_err,
+                            "_toolNote": (
+                                "Pass **body** as a nested JSON **object** when the action requires a body."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
             result = api.put_action(
                 p_action,
                 params=prms,
-                body=inp.get("body"),
+                body=action_body,
             )
             return json.dumps(result, ensure_ascii=False)
 
@@ -3004,6 +3346,9 @@ def _pdf_supplier_invoice_context_hint(files: list[FileAttachment], prompt: str)
 
 def run_agent(prompt: str, api: TripletexAPI, files: list[FileAttachment]) -> None:
     client = anthropic.Anthropic()
+    task_family = infer_task_family(prompt)
+    dynamic_system = build_dynamic_system_prompt(prompt)
+    _agent_print(f"  📂 Task family (router): {task_family}")
 
     # Build user message content
     content = []
@@ -3071,6 +3416,10 @@ def run_agent(prompt: str, api: TripletexAPI, files: list[FileAttachment]) -> No
     if hint_sup:
         content.append({"type": "text", "text": hint_sup})
 
+    struct_hints = extract_prompt_structured_hints(prompt)
+    if struct_hints:
+        content.append({"type": "text", "text": struct_hints})
+
     content.append({"type": "text", "text": prompt})
     messages = [{"role": "user", "content": content}]
 
@@ -3083,7 +3432,7 @@ def run_agent(prompt: str, api: TripletexAPI, files: list[FileAttachment]) -> No
             return client.messages.create(
                 model      = "claude-sonnet-4-20250514",
                 max_tokens = 4096,
-                system     = SYSTEM_PROMPT,
+                system     = dynamic_system,
                 tools      = TOOLS,
                 messages   = messages,
             )
